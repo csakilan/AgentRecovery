@@ -1,0 +1,43 @@
+[project]
+name = "agent-recovery-lab"
+version = "0.1.0"
+description = "Measuring recovery of LangGraph agent tool operations after ambiguous failures and crashes"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.142.2",
+    "psycopg-pool>=3.3.3",
+    "psycopg[binary]>=3.3.6",
+    "pydantic>=2.13.5",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --import-mode=importlib"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "."]
+extend-exclude = ["tests/reference"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Header", "fastapi.Depends"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
