@@ -1,7 +1,11 @@
 from collections import Counter
 
+import pytest
+from pydantic import ValidationError
+
 from lab.protocol.faults import World, world_fault_plan
 from lab.protocol.manifest import (
+    EpisodeSpec,
     Manifest,
     Mode,
     behavior_matrix,
@@ -24,6 +28,68 @@ def test_behavior_matrix_default_is_48_mode_a_episodes():
 def test_behavior_matrix_can_regenerate_the_original_96():
     m = behavior_matrix(prompts=("neutral", "careful"))
     assert len(m.episodes) == 96
+    assert len({e.episode_id for e in m.episodes}) == 96
+
+
+@pytest.mark.parametrize(
+    ("factory", "seed", "digest"),
+    [
+        (
+            behavior_matrix,
+            20261004,
+            "a049448d376b591716f53206d401400f5cd6e9a30d2c1e10bf89187fca9b7887",
+        ),
+        (
+            infrastructure_matrix,
+            20261005,
+            "4059fe7115cdffef1cdccb8dc79dda18d4fba7c68d8f9944df484fcbd189092d",
+        ),
+    ],
+)
+def test_default_matrices_pin_the_experiment_seed_and_contents(factory, seed, digest):
+    manifest = factory()
+    assert manifest.seed == seed
+    assert manifest.sha256() == digest
+
+
+@pytest.mark.parametrize(
+    ("prompt", "suffix"), [("neutral", ""), ("careful", "/careful"), ("terse", "/terse")]
+)
+def test_prompt_variant_has_a_distinct_episode_id(prompt, suffix):
+    spec = make_spec("x", World.LOST_ACK, Mode.AGENT_DIRECTED, True, 3, prompt)
+    assert spec.episode_id == f"x/lost_ack/status/agent_directed/r03{suffix}"
+
+
+@pytest.mark.parametrize(
+    ("world", "expect_effect", "eligible_recoverable"),
+    [
+        (World.HEALTHY, True, False),
+        (World.LOST_ACK, True, True),
+        (World.TRUE_FAIL, True, True),
+        (World.PERMANENT_FAIL, False, False),
+    ],
+)
+def test_each_world_has_the_intended_scoring_flags(world, expect_effect, eligible_recoverable):
+    spec = make_spec("x", world, Mode.AGENT_DIRECTED, True, 0)
+    assert spec.expect_effect is expect_effect
+    assert spec.eligible_recoverable is eligible_recoverable
+
+
+@pytest.mark.parametrize("kind", [Manifest, EpisodeSpec])
+def test_experiment_models_are_frozen(kind):
+    manifest = behavior_matrix()
+    model = manifest if kind is Manifest else manifest.episodes[0]
+    field = "seed" if kind is Manifest else "repetition"
+    with pytest.raises(ValidationError, match="frozen_instance"):
+        setattr(model, field, 1)
+
+
+@pytest.mark.parametrize("kind", [Manifest, EpisodeSpec])
+def test_experiment_models_reject_unknown_fields(kind):
+    manifest = behavior_matrix()
+    model = manifest if kind is Manifest else manifest.episodes[0]
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        kind.model_validate({**model.model_dump(), "surprise": True})
 
 
 def test_infrastructure_matrix_default_is_144_episodes():
