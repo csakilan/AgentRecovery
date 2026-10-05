@@ -1,12 +1,12 @@
 # Handoff
 
-**Written:** 2026-10-04. **For:** the next assistant or developer to pick this up,
+**Updated:** 2026-10-05. **For:** the next assistant or developer to pick this up,
 with no access to the conversation that produced it. Everything needed is in this
 repository.
 
 Start here, then read in this order:
 
-1. `docs/decisions.md` — D1 to D7, all accepted by the user. These constrain
+1. `docs/decisions.md`: D1 to D8, all accepted by the user. These constrain
    everything. Do not reverse one without asking.
 2. `docs/superpowers/plans/2026-10-04-roadmap.md` — the eight-stage plan, the
    architecture, the contracts, the operation state machine, the evaluation
@@ -50,12 +50,19 @@ Python 3.12.8, uv 0.12.22, Docker 24.0.2, Docker Compose 2.18.1, git 2.50.1,
 Node 22.20.0. There is **no local `psql`**; use Python or `docker compose exec`.
 
 ```bash
-uv sync                                    # install
-docker compose up -d --wait postgres       # Postgres 16 on host port 54329
-uv run pytest -q                           # whole suite
-uv run pytest tests/unit -q                # no database needed
-uv run ruff format . && uv run ruff check . # formatter first, then linter
+uv sync --frozen                                # install locked dependencies
+docker compose up -d --wait postgres            # Postgres 16 on host port 54329
+uv run pytest -q                                # whole suite
+uv run pytest tests/unit -q                     # no database needed
+uv run ruff format src tests                    # format Python files only
+uv run ruff check .                             # lint
+uv run ruff format --check src tests            # verify Python formatting
 ```
+
+The locked formatter also checks Python examples inside Markdown. A whole-repo
+format check currently flags the two planning documents. Those examples have
+not been reformatted; the plans are preserved. Address that check's scope before
+adding CI in Task 11.
 
 Dev-only credentials live in `.env.example` and `compose.yaml`:
 `dev-client-token`, `dev-control-token`, `dev-payment-svc`, `dev-ledger-reader`.
@@ -63,9 +70,13 @@ They are fake. Never commit a real secret, and never create a `.env` file.
 
 ## Repository state
 
-Branch `plan-1-oracle-and-simulator`, five commits ahead of `main`. `main` holds
-planning documents only. Everything is pushed to
-`https://github.com/csakilan/AgentRecovery`.
+Branch `plan-1-oracle-and-simulator`. `main` holds planning documents only.
+Repository: `https://github.com/csakilan/AgentRecovery`.
+
+The user authorized committing and pushing the Task 4 coverage fixes, Task 5's
+oracle implementation and tests, and updates to this file and `decisions.md`.
+The code commits are listed below. Work remains stopped after Task 5.
+The pre-existing untracked `.DS_Store` was left alone.
 
 | Commit | Content |
 |---|---|
@@ -75,17 +86,31 @@ planning documents only. Everything is pushed to
 | `9904380` | Task 3: `faults.py` (hidden worlds) and `render.py` (exact model-visible text) |
 | `dfca97e` | Task 4: `manifest.py` — episode specs and the two experiment matrices |
 | `0292763` | Docs: paused state |
+| `f80d0d6` | Docs: consolidate the handoff |
+| `b39c4cb` | Task 4: pin manifest seeds, IDs, scoring flags and schema restrictions |
+| `01805eb` | Task 5: legacy and extended oracle scoring, with regression tests |
 
-36 unit tests pass. `tests/test_environment.py` fails for an environment reason,
-not a code reason; see the Docker blocker below.
+Verification on 2026-10-05:
+
+- Unit suite: **72 passed** (22 task-argument, 7 fault/render, 20 manifest,
+  23 scoring cases).
+- Full suite: **72 passed, 1 failed**. The failure is
+  `tests/test_environment.py::test_postgres_16_is_reachable`: the local server on
+  port 54329 closes the connection unexpectedly. The full suite is not green.
+- Python lint and formatting checks pass.
+- Nine intentional manifest regressions and four scoring regressions were
+  caught by tests. The mutations ran only in child-process memory; no broken
+  source file was written.
+- Task 5's tests were run before implementation and failed at collection with
+  `ModuleNotFoundError: No module named 'lab.oracle'`.
 
 | Task | State |
 |---|---|
 | 1. Scaffold and environment test | Complete, review clean |
 | 2. Task constants and canonical arguments | Complete, review clean |
 | 3. Hidden fault plans and observation text | Complete, review clean |
-| 4. Episode manifests and matrices | Code committed, spec passed, **quality review unresolved** |
-| 5. Oracle scoring | **Not started. Needs no database, so start here.** |
+| 4. Episode manifests and matrices | Committed; all four coverage findings addressed |
+| 5. Oracle scoring | Implemented, tested and committed |
 | 6. Database helpers, simulator schema, fixtures | Not started, needs Postgres |
 | 7. Simulator charge and status logic | Not started, needs Postgres |
 | 8. Concurrency guarantee and commit barriers | Not started, needs Postgres |
@@ -96,6 +121,38 @@ not a code reason; see the Docker blocker below.
 Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
+
+## Current stop: Task 5 completed; publishing authorized
+
+The user initially asked to stop after Task 5, run the tests, and leave the
+changes for their review before committing. On 2026-10-05, they subsequently
+authorized committing and pushing the changes. Task 6 has not been started.
+No independent code review of this batch has been performed.
+
+Task 5 adds frozen ledger record types and pure scoring functions. It does not
+read Postgres yet; the read-only ledger reader belongs to Task 10. Its production
+code follows the Task 5 plan, with no changes to scoring semantics.
+
+Scoring conventions for future reviews:
+
+- The legacy score counts effects only, so one wrong-amount charge still has
+  `legacy.correct == 1`; the extended verdict reports `WRONG_EFFECT`.
+- `correct_recovery` means a correct verdict completed before the deadline.
+  `eligible_recoverable` is separate: aggregate recovery rates must filter on
+  that flag. A healthy or expected-no-effect episode can have a correct verdict
+  while remaining outside the recovery denominator.
+- An explicit `unresolved` claim is a truthful uncertainty report under the
+  planned definition. No effect when none is expected can score
+  `CORRECT_NO_EFFECT` with a `failed` or `unresolved` claim. Neither counts in the
+  recoverable denominator for a permanent-failure episode.
+
+The accepted matrices are 48 behavior episodes plus 144 infrastructure episodes,
+192 total and at most 1152 model requests at six turns each, excluding the pilot
+and rerun reserve. D1's older arithmetic has been reconciled with D4.
+
+The next implementation task is Task 6; the user has not asked to begin it.
+It needs working Postgres. The roadmap and detailed plan still contain their
+historical planning-only status labels; this file records current progress.
 
 ## Blocker one: Docker, and the user owns it
 
@@ -109,6 +166,10 @@ it; `docker exec` and `docker restart` both hang indefinitely; `docker version`
 answers in 0.09s. Restarting only the project's container does not work, because
 that is one of the hanging commands.
 
+The original diagnosis above was recorded on 2026-10-04. On 2026-10-05, the
+connectivity test was rerun from the host and still failed with an unexpectedly
+closed connection on both IPv4 and IPv6. Docker Desktop was not restarted.
+
 The remedy is restarting Docker Desktop, which also bounces the user's unrelated
 `kind-registry` container. **The user chose to do this themselves.** Do not
 restart Docker Desktop without asking them again. Once they confirm:
@@ -120,7 +181,7 @@ uv run pytest tests/test_environment.py -v
 
 Expect a pass. Tasks 6 to 11 are then unblocked.
 
-## Blocker two: an open decision the user has not made
+## Task 4 review findings: addressed
 
 The Task 4 review found that the tests the plan itself specifies do not pin the
 experiment's own definition. All four findings are in
@@ -143,14 +204,14 @@ these exact tests and also forbids writing anything the brief did not ask for, s
 adding assertions exceeds the brief. The reviewer separately confirmed the
 implementation is correct on all four points.
 
-Options put to the user: strengthen all four now; keep the plan verbatim and
-defer all four to the final whole-branch review; or strengthen only the seeds and
-the world flags, the two that would corrupt results. **The user paused instead of
-choosing. Ask before acting.** The prior recommendation was the third option.
+On 2026-10-05, the user accepted strengthening all four before implementing
+Task 5 (D8). The committed tests now pin the seeds and full manifest hashes,
+check prompt suffixes and two-prompt ID uniqueness, cover all four worlds'
+scoring flags, and enforce frozen/extra-forbidden behavior on both models.
 
-The general version of the question, which will recur: should each task's tests
-pin the project's constants, or is that a final-review concern? The plan's tests
-were written to specify behaviour, not to resist tampering.
+All nine deliberate mutations covering these findings were caught. Task 4's
+production code was not modified. The decision is resolved, and the user
+authorized committing and pushing the coverage changes.
 
 ## How the work has been run
 

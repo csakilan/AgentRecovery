@@ -2,9 +2,10 @@
 
 Agent Recovery Lab. One entry per decision that constrains the design.
 
-**Project status: planning only.** No application code, no deployed
-infrastructure, no paid model runs, no published artifacts. Nothing in this
-file records a measured result.
+**Project status, 2026-10-05:** protocol code and pure oracle scoring are
+implemented through Task 5. The user authorized committing and pushing the
+Task 4 coverage fixes and Task 5 changes. No deployed infrastructure, model runs,
+or published artifacts. Nothing in this file records an experimental result.
 
 ---
 
@@ -20,9 +21,9 @@ stays inside the approximately $300 of GCP credits.
 
 Consequences:
 
-- Evaluation is planned against a daily request ceiling. The two frozen
-  matrices total 168 episodes, at most 1008 model requests at a six-turn cap,
-  so the frozen run is a multi-day batch and must be scheduled as the final
+- Evaluation is planned against a daily request ceiling. Under the accepted
+  D4 design, the two matrices total 192 episodes, at most 1152 model requests at
+  a six-turn cap, so the frozen run is a multi-day batch and must be scheduled as the final
   activity rather than squeezed into a build day.
 - Deterministic crash, concurrency and security regressions use scripted model
   behavior and consume no model requests, so CI stays free indefinitely.
@@ -171,3 +172,25 @@ in total.
   the project and should be readable as SQL. Three databases on one instance make
   Alembic's multi-database setup more trouble than it saves.
 - Postgres 16 in Docker for local work and tests. No local `psql` is assumed.
+
+## D8. Task 4 coverage and the Task 5 review checkpoint
+
+**Date:** 2026-10-05
+**Status:** accepted by the user
+
+The user accepted the proposed batch: address all four Task 4 coverage findings,
+implement Task 5, run the tests, and stop for their review before committing.
+This resolves the earlier decision to defer or strengthen Task 4's tests.
+
+- Pin both default seeds and the complete default manifest hashes.
+- Check prompt suffixes and unique IDs in the original two-prompt matrix.
+- Check expected-effect and recovery-eligibility flags for all four worlds.
+- Check that both experiment models reject mutation and unknown fields.
+- Keep Task 4's production behavior unchanged.
+- Implement Task 5's planned scoring contract, with regression checks for
+  mixed effect counts and propagation of recovery-denominator eligibility.
+
+The batch ends after Task 5. Tasks 6 onward are not authorized by this batch.
+The changes were initially left uncommitted at the user's review checkpoint.
+The user subsequently authorized committing and pushing the batch on
+2026-10-05. Work remains stopped after Task 5.
