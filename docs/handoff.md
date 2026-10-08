@@ -94,12 +94,19 @@ The pre-existing untracked `.DS_Store` was left alone.
 | `2d37906` | Docs: Task 5 review, fix wave and Docker resolution |
 | `9be08ad` | Task 6: `db.py`, simulator schema and roles, pytest fixtures |
 | `2fb1e36` | Task 6 fix: assert the read-only boundary on every ledger table |
+| `9f17bb5` | Docs: Task 6 and the verified privilege boundary |
+| `d39c916` | Task 7: `service.py` — atomic idempotent charges, status, hidden worlds |
+| `f1f2972` | Task 7 fix: assert world indistinguishability and pin message literals |
+| `6f00610` | Docs: Task 7 and D9 |
+| `51cf48a` | Task 8: concurrency proof, commit barriers, D9 call-accounting fix |
+| `a0f73ce` | Task 8 fix: pin claim atomicity and the barrier timeout |
 
 Verification on 2026-10-08, after starting Docker:
 
-- Full suite: **109 passed, 0 failed**, including
+- Full suite: **164 passed, 0 failed**, including
   `tests/test_environment.py::test_postgres_16_is_reachable`. The suite went
-  green for the first time on this date, at 90 passed, before Task 6 added 19.
+  green for the first time on this date, at 90 passed, then 109 after Task 6,
+  145 after Task 7 and 164 after Task 8.
 - Python lint and formatting checks pass.
 - The Oct 5 batch (`b39c4cb` + `01805eb`) received its first independent review
   on 2026-10-08: spec compliance passed, quality approved, no Critical issues and
@@ -123,24 +130,19 @@ test while Docker was down.
 | 5. Oracle scoring | Complete; reviewed, six findings fixed, re-review accepted |
 | 6. Database helpers, simulator schema, fixtures | Complete; reviewed, one finding fixed, re-review accepted |
 | 7. Simulator charge and status logic | Complete; reviewed, three findings fixed, one folded into Task 8 (D9) |
-| 8. Concurrency guarantee and commit barriers | **Not started. Next task. Carries a binding requirement from D9** |
-| 9. Public and internal HTTP apps | Not started |
-| 10. Ledger reader and RetryLedger parity | Not started. See the `Decimal` caveat below |
+| 8. Concurrency guarantee and commit barriers | Complete; reviewed, two findings fixed, D9 satisfied |
+| 9. Public and internal HTTP apps | **Not started. Next task** |
+| 10. Ledger reader and RetryLedger parity | Not started. See the `Decimal` caveat and the Task 8 consequences below |
 | 11. Container, compose, CI, protocol document | Not started |
 
 Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
 
-## Current stop: Task 7 complete and reviewed
+## Current stop: Task 8 complete and reviewed
 
-Tasks 1 to 7 are done, each through both gates. Task 8, the concurrency
-guarantee and the synchronized commit barriers, is next. Postgres is running.
-
-Task 8 carries a binding requirement from D9: it must fix the call-counter
-ordering described under "Task 7 review" below, with a test that injects a
-failure between the counter increment and the call log. Task 8 is not complete
-while that is open.
+Tasks 1 to 8 are done, each through both gates. Task 9, the public and internal
+HTTP apps, is next. Postgres is running. D9 is satisfied; see the Task 8 section.
 
 Task 5 adds frozen ledger record types and pure scoring functions. It does not
 read Postgres yet; the read-only ledger reader belongs to Task 10. Its production
@@ -376,7 +378,69 @@ writing the call log, so any exception in between consumes a fault-schedule slot
 while leaving no record of the attempt. That skews `n_charge_attempts` and
 `reused_key_on_retry`, both of which are reported metrics. Task 8's barrier wait
 lands in exactly that window, so Task 8 owns the fix and must carry a test that
-injects a failure between the increment and the log.
+injects a failure between the increment and the log. **Resolved in Task 8; see
+below.**
+
+## Task 8 review, 2026-10-08: the guarantee proved, and D9 resolved
+
+**The barrier property holds, which matters because every later crash test
+depends on it.** While a charge was held at `after_commit:1`, a second connection
+under the `ledger_reader` role saw the committed charge while the held request's
+response had not been produced. That is the mechanism for simulating a payment
+that succeeded while the caller never learned of it. Across 477 samples of
+`pg_stat_activity` the held backend was never `idle in transaction` and held no
+transaction lock, and a concurrent update of the same namespace row completed in
+under 9 ms, so nothing is held open while waiting. A pre-released barrier
+completes in 0.016 s, and an unreleased one continues after its timeout with a
+200 rather than raising.
+
+**The exactly-once guarantee is proved falsifiable.** Removing the unique
+constraint and substituting a check-then-insert made the same-key race test fail
+3 of 3 runs with two committed effects, reproduced independently by the reviewer
+in its own scratch tree and database. Both same-key tests catch it.
+
+**D9 is resolved, and the fix turned out to matter more than expected.** `charge`
+and `status` now claim the fault-schedule slot and insert an `in_flight`
+call-log row in one atomic statement, with no lock and no transaction held across
+a barrier wait, then finalise that row; a raising call finalises as
+`server_error`. So a worker killed inside a barrier is still counted.
+
+The consequence for the legacy score is the part worth knowing. Take one killed
+attempt, one raising attempt and one success. The plan's `read_ledger` query now
+yields `n_charge_attempts = 3` and `reused_key_on_retry = 1`, matching the
+namespace's own `charge_calls = 3`, and matching the original project, whose
+attempt counter increments at the START of each charge call. Before this fix the
+same episode would have given 1 and 0: silently wrong on exactly the crash
+episodes this project exists to study.
+
+**Two Important findings, fixed in `a0f73ce`, both test-only.** Nothing defended
+the atomicity D9 exists to protect: splitting that single statement in two passed
+all 160 tests. And the barrier timeout test asserted only a 200 response, so it
+passed even when `hold` never waited at all. Both are now pinned and both were
+confirmed by independent mutation.
+
+Honest limit on that coverage, recorded rather than smoothed over: the reviewer
+rates it "adequate for D9 but minimal". The detecting test catches an
+update-first split and is coupled to the `CheckViolation` exception type and to
+`_claim_call`'s private signature. An insert-first, read-then-write variant slips
+past it, though the 16-way concurrency test and `test_concurrency.py` catch that
+one, which is why both sets of tests are kept. A split legitimately wrapped in
+`conn.transaction()` passes, correctly, since it is genuinely atomic.
+
+### Required reading for Task 10
+
+The call log now contains rows it previously would not have: `in_flight` rows for
+claimed slots and `server_error` rows for failures. Therefore:
+
+- `read_ledger` must NOT filter `call_log` on `outcome`. The plan's
+  `call_index IS NOT NULL` predicate is already correct and should be kept.
+- Add a test pinning that a crashed attempt still counts toward
+  `n_charge_attempts`, since that is the behaviour that brings the legacy score
+  into agreement with the original project.
+- Expect `read_ledger` to be called while a request is mid-flight, and make sure
+  that is well defined rather than accidental.
+- `call_log.id` is now claim order, not completion order. Any reader that assumed
+  completion order must be corrected.
 
 ## How the work has been run
 
@@ -456,6 +520,18 @@ asserts that the reader's SELECT on `barriers` is denied, only its writes.
 
 **Task 7.** The invalid-request logging path can raise `TypeError` on a payload
 the validator has just rejected, for instance one carrying a `Decimal`.
+
+**Task 8.** `call_log.outcome` has no CHECK constraint although `profile` and
+`endpoint` do, so a new outcome value is accepted silently. The `http_status = 0`
+sentinel on an `in_flight` row forecloses a natural `BETWEEN 100 AND 599` check.
+Nothing asserts that `server_error` and `in_flight` never survive on a normal
+path, though it was verified by hand that they do not. `_finish_call` keys on the
+global `call_log.id` with no namespace or `in_flight` guard. The
+namespace-reset-mid-call path now raises `RuntimeError`, is untested, and can
+fire after a charge has committed. `_wait_until` is duplicated verbatim across
+test files. `_log` now handles only the invalid-request path, so its name no
+longer describes it. `thread.join(5)` is called without asserting the thread
+finished, so a hang surfaces as a `KeyError` rather than a clear failure.
 
 ## One ruling already made
 
