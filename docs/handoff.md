@@ -91,11 +91,15 @@ The pre-existing untracked `.DS_Store` was left alone.
 | `01805eb` | Task 5: legacy and extended oracle scoring, with regression tests |
 | `d0bb878` | Docs: Task 5 checkpoint and publishing approval |
 | `f35375c` | Task 5 fix wave: close six review findings (see below) |
+| `2d37906` | Docs: Task 5 review, fix wave and Docker resolution |
+| `9be08ad` | Task 6: `db.py`, simulator schema and roles, pytest fixtures |
+| `2fb1e36` | Task 6 fix: assert the read-only boundary on every ledger table |
 
 Verification on 2026-10-08, after starting Docker:
 
-- Full suite: **90 passed, 0 failed.** Green for the first time, including
-  `tests/test_environment.py::test_postgres_16_is_reachable`.
+- Full suite: **109 passed, 0 failed**, including
+  `tests/test_environment.py::test_postgres_16_is_reachable`. The suite went
+  green for the first time on this date, at 90 passed, before Task 6 added 19.
 - Python lint and formatting checks pass.
 - The Oct 5 batch (`b39c4cb` + `01805eb`) received its first independent review
   on 2026-10-08: spec compliance passed, quality approved, no Critical issues and
@@ -117,8 +121,8 @@ test while Docker was down.
 | 3. Hidden fault plans and observation text | Complete, review clean |
 | 4. Episode manifests and matrices | Complete; all four coverage findings addressed and reviewed |
 | 5. Oracle scoring | Complete; reviewed, six findings fixed, re-review accepted |
-| 6. Database helpers, simulator schema, fixtures | **Not started. Next task. Postgres is now up** |
-| 7. Simulator charge and status logic | Not started |
+| 6. Database helpers, simulator schema, fixtures | Complete; reviewed, one finding fixed, re-review accepted |
+| 7. Simulator charge and status logic | **Not started. Next task** |
 | 8. Concurrency guarantee and commit barriers | Not started |
 | 9. Public and internal HTTP apps | Not started |
 | 10. Ledger reader and RetryLedger parity | Not started. See the `Decimal` caveat below |
@@ -128,10 +132,10 @@ Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
 
-## Current stop: Task 5 complete and reviewed
+## Current stop: Task 6 complete and reviewed
 
-Tasks 1 to 5 are done, each through both gates. Task 6 has not been started and
-is the next implementation task. Postgres is running, so nothing blocks it.
+Tasks 1 to 6 are done, each through both gates. Task 7, the simulator's charge
+and status logic, is next and nothing blocks it. Postgres is running.
 
 Task 5 adds frozen ledger record types and pure scoring functions. It does not
 read Postgres yet; the read-only ledger reader belongs to Task 10. Its production
@@ -267,6 +271,52 @@ values rather than passing a raw row value through. Postgres `NUMERIC` comes bac
 from psycopg as `Decimal` already, so this should be a non-event, but construct
 it explicitly rather than relying on that.
 
+## Task 6 review, 2026-10-08: the privilege boundary, verified
+
+Task 6 creates the boundary the project's independence claim rests on, so its
+review was run empirically against the live database rather than by reading SQL.
+
+**Confirmed from live `ledger_reader` connections.** SELECT is allowed on
+`sim_namespaces`, `charges` and `call_log`. INSERT, UPDATE, DELETE, TRUNCATE and
+`SELECT FOR UPDATE` all raise `InsufficientPrivilege` on all five tables,
+including `barriers` and `schema_migrations`. The role holds no sequence
+privileges, has no `pg_default_acl` entries and therefore no rights on future
+tables, is not a superuser and owns nothing. `payment_svc` holds `arwd` on the
+four tables plus usage on both sequences and nothing more; TRUNCATE, CREATE TABLE
+and all access to `schema_migrations` are denied. The per-test TRUNCATE in the
+fixtures runs on the admin connection, as the plan intends.
+
+**Also confirmed.** `charges_namespace_idempotency_key_key` is UNIQUE on
+`(namespace, idempotency_key)` in that order and is not deferrable; this one
+constraint is what makes concurrent same-key charges produce exactly one effect
+in Task 8. A migration that fails midway rolls back cleanly, leaving no tables,
+and re-applying returns an empty list. `RESTART IDENTITY` resets ids to 1. No
+stray `payments_test_*` database survives, even after deliberately failed runs.
+
+**One Important finding, fixed in `2fb1e36`.** The committed test probed only an
+INSERT against `sim_namespaces`, so granting the reader write access to `charges`
+left the suite green. `charges` is the payment ledger, making that the one leak
+that would invalidate every published result. The test now asserts SELECT
+succeeds and INSERT, UPDATE and DELETE are each denied across all three readable
+tables, plus that `barriers` cannot be written, as 15 parametrized cases.
+
+A re-review proved falsifiability independently, with its own scratch databases:
+granting write on `charges` fails exactly the three `charges` cases, and the same
+for `call_log`.
+
+**A trap worth knowing about, because it will recur.** The first draft of that
+test appeared to deny a `charges` INSERT even under a deliberate write grant. The
+real cause was that `charges.id` is BIGSERIAL and the reader has no privilege on
+the sequence, so `nextval()` failed before the table privilege was ever checked.
+The test passed for the wrong reason. The committed version supplies explicit ids
+so a table-privilege error is the only possible failure. When testing a denial,
+confirm the statement would otherwise succeed.
+
+**Carry forward to Task 7 and beyond.** Because there are no default ACLs, any
+later migration that adds a table the evaluator must read has to carry its own
+explicit `GRANT SELECT ... TO ledger_reader`. Without it the evaluator is simply
+blind to that table, and nothing will fail loudly to tell you.
+
 ## How the work has been run
 
 Task by task, strictly test-first: write the test, run it and watch it fail for
@@ -331,6 +381,17 @@ scoring path yet; Task 10 populates them. The new eligibility test derives its
 inputs from `spec.expect_effect`, so its `correct_recovery` half cannot detect a
 flag flip. `Decimal("NaN")` is still accepted as an amount, though it fails safe
 as `WRONG_EFFECT`.
+
+**Task 6.** The roles-before-GRANTs precondition in the migration is unenforced
+and undocumented, though it fails loudly with a full rollback. `ensure_role` puts
+the password in the statement text via `sql.Literal`, which is unavoidable for
+`CREATE ROLE` but is visible to `log_statement`. `with_database` builds the URL
+with f-strings and no percent-encoding, so a password containing `@ : / #` would
+silently break it. `apply_migrations` has no concurrency guard, which is
+unreachable today because each test session mints its own database. `CHARGE`,
+`COMPAT_CHARGE`, `charges()` and the `conn` fixture are committed unreferenced;
+they are plan-mandated for Task 7, which is where they first get used. No test
+asserts that the reader's SELECT on `barriers` is denied, only its writes.
 
 ## One ruling already made
 
