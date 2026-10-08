@@ -62,9 +62,20 @@ def test_pre_released_barrier_does_not_block(conn):
 
 
 def test_unreleased_barrier_times_out_and_continues(conn):
+    """The call waits out the timeout, then carries on rather than raising."""
+    timeout_s = 0.3
     service.configure_namespace(conn, "ns", Profile.CONTROLLED, FaultPlan(hold_after_commit=(1,)))
-    r = service.charge(conn, "ns", dict(CHARGE), barrier_timeout_s=0.2)
+    started = time.monotonic()
+    r = service.charge(conn, "ns", dict(CHARGE), barrier_timeout_s=timeout_s)
+    elapsed = time.monotonic() - started
     assert r.http_status == 200
+    assert len(charges(conn, "ns")) == 1
+    # Generous lower bound, no upper bound: a loaded machine may be slow but never early.
+    assert elapsed >= timeout_s * 0.9, f"returned after {elapsed:.3f}s without waiting"
+    assert service.barrier_state(conn, "ns", "after_commit:1") == {
+        "reached": True,
+        "released": False,
+    }
 
 
 def test_barrier_state_for_unknown_barrier(conn):

@@ -2,6 +2,7 @@
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 import pytest
@@ -10,7 +11,7 @@ from psycopg.rows import dict_row
 from lab.protocol.faults import FaultPlan
 from lab.protocol.task import Profile
 from lab.simulator import service
-from tests.helpers import CHARGE
+from tests.helpers import CHARGE, COMPAT_CHARGE
 
 
 def _counters(conn, ns):
@@ -120,3 +121,89 @@ def test_slot_and_log_row_appear_together_while_the_request_is_held(svc_url, con
     assert [(r["call_index"], r["outcome"]) for r in _log(conn, "ns", "charge")] == [
         (1, "committed")
     ]
+
+
+def _assert_slots_and_log_agree(conn, ns):
+    """Each counter equals its endpoint's indexed log rows, and the indexes are 1..N."""
+    counters = _counters(conn, ns)
+    for endpoint, counter in (("charge", "charge_calls"), ("status", "status_calls")):
+        indexes = sorted(
+            r["call_index"] for r in _log(conn, ns, endpoint) if r["call_index"] is not None
+        )
+        assert counters[counter] == len(indexes), endpoint
+        assert indexes == list(range(1, len(indexes) + 1)), endpoint
+
+
+@pytest.mark.parametrize("counter", ["charge_calls", "status_calls"])
+def test_claim_is_atomic_when_the_log_insert_fails(conn, counter):
+    """The slot is consumed in the same statement as the log row, never apart from it.
+
+    An endpoint outside the call_log CHECK constraint makes the insert half of the claim
+    fail after its update half has produced a row. One statement rolls both back. Two
+    statements would leave the counter advanced with no row, which is the state a worker
+    killed between them leaves behind, and D9 exists to make that state impossible.
+    """
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, FaultPlan())
+    with pytest.raises(psycopg.errors.CheckViolation):
+        service._claim_call(conn, "ns", "not-an-endpoint", counter, "k1", {})
+    assert _counters(conn, "ns")[counter] == 0
+    assert _log(conn, "ns", "charge") == []
+    assert _log(conn, "ns", "status") == []
+    # The schedule is untouched: the next real call still gets index 1.
+    assert service._claim_call(conn, "ns", "charge", counter, "k1", {})[0] == 1
+
+
+def test_slots_and_log_rows_agree_across_mixed_outcomes(conn, monkeypatch):
+    plan = FaultPlan(
+        charge={2: "commit_then_error", 3: "error_no_commit"}, status_unavailable_calls=1
+    )
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, plan)
+    service.charge(conn, "ns", dict(CHARGE))  # 1: committed
+    service.charge(conn, "ns", dict(CHARGE))  # 2: existing_then_error
+    service.charge(conn, "ns", dict(CHARGE))  # 3: error_no_commit
+    service.charge(conn, "ns", dict(CHARGE))  # 4: replayed
+    service.charge(conn, "ns", {**CHARGE, "order_id": "other"})  # 5: conflict
+    service.charge(conn, "ns", {"idempotency_key": "k1"})  # invalid: no slot
+    service.status(conn, "ns", "k1")  # 1: unavailable
+    service.status(conn, "ns", "k1")  # 2: succeeded
+    service.status(conn, "ns", "nope")  # 3: not found
+    with monkeypatch.context() as m:
+        m.setattr(service, "_insert_or_get", _boom)
+        with pytest.raises(RuntimeError):
+            service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k2"})  # 6: server_error
+    service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k3"})  # 7: committed
+    _assert_slots_and_log_agree(conn, "ns")
+    assert _counters(conn, "ns") == {"charge_calls": 7, "status_calls": 3}
+    assert [r["outcome"] for r in _log(conn, "ns", "charge") if r["call_index"]] == [
+        "committed",
+        "existing_then_error",
+        "error_no_commit",
+        "replayed",
+        "conflict",
+        "server_error",
+        "committed",
+    ]
+
+
+def test_slots_and_log_rows_agree_under_concurrent_calls(svc_url, conn):
+    workers = 16
+
+    def call(args):
+        i, start = args
+        with psycopg.connect(svc_url, autocommit=True, row_factory=dict_row) as c:
+            start.wait()
+            if i % 4 == 3:
+                return service.status(c, ns, "k0")
+            # Half the charges share a key, so replays and fresh commits race together.
+            return service.charge(c, ns, {**COMPAT_CHARGE, "idempotency_key": f"k{i % 2}"})
+
+    for round_ in range(5):
+        ns = f"race-{round_}"
+        service.configure_namespace(conn, ns, Profile.COMPAT, FaultPlan())
+        start = threading.Barrier(workers)
+        with ThreadPoolExecutor(workers) as pool:
+            list(pool.map(call, [(i, start) for i in range(workers)]))
+        _assert_slots_and_log_agree(conn, ns)
+        assert _counters(conn, ns) == {"charge_calls": 12, "status_calls": 4}
+        assert not [r for r in _log(conn, ns, "charge") if r["outcome"] == service.IN_FLIGHT]
+        assert not [r for r in _log(conn, ns, "status") if r["outcome"] == service.IN_FLIGHT]
