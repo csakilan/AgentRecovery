@@ -7,6 +7,7 @@ no row lock outlives the statement or transaction block that needs it.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import time
 from dataclasses import dataclass
@@ -31,6 +32,12 @@ CONFLICT_MESSAGE = (
     "this idempotency key was already used with different parameters. No charge was made."
 )
 STATUS_UNAVAILABLE_MESSAGE = "payment status service is temporarily unavailable."
+SERVER_ERROR_MESSAGE = "the simulator failed while handling this call."
+
+# Call-log outcome of a call whose slot is claimed but whose result is not yet recorded.
+IN_FLIGHT = "in_flight"
+# Call-log outcome of a call that raised after its slot was claimed.
+SERVER_ERROR = "server_error"
 
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
 _COMPAT_FIELDS = frozenset({"amount", "idempotency_key"})
@@ -95,6 +102,51 @@ def delete_namespace(conn: psycopg.Connection, namespace: str) -> None:
     conn.execute("DELETE FROM sim_namespaces WHERE namespace = %s", (namespace,))
 
 
+def hold(conn: psycopg.Connection, namespace: str, name: str, timeout_s: float) -> bool:
+    """Mark a barrier reached, then wait until it is released or the timeout passes.
+
+    The connection is in autocommit mode, so the caller holds no transaction while
+    waiting. A charge held after commit has its effect visible in the ledger while
+    its response has not yet been sent.
+    """
+    conn.execute(
+        "INSERT INTO barriers (namespace, name, reached_at) VALUES (%s, %s, now())"
+        " ON CONFLICT (namespace, name) DO UPDATE SET reached_at = now()",
+        (namespace, name),
+    )
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        row = _one(
+            conn,
+            "SELECT released_at FROM barriers WHERE namespace = %s AND name = %s",
+            (namespace, name),
+        )
+        if row is not None and row["released_at"] is not None:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def release_barrier(conn: psycopg.Connection, namespace: str, name: str) -> None:
+    conn.execute(
+        "INSERT INTO barriers (namespace, name, released_at) VALUES (%s, %s, now())"
+        " ON CONFLICT (namespace, name) DO UPDATE SET released_at = now()",
+        (namespace, name),
+    )
+
+
+def barrier_state(conn: psycopg.Connection, namespace: str, name: str) -> dict[str, bool]:
+    row = _one(
+        conn,
+        "SELECT reached_at, released_at FROM barriers WHERE namespace = %s AND name = %s",
+        (namespace, name),
+    )
+    return {
+        "reached": bool(row and row["reached_at"]),
+        "released": bool(row and row["released_at"]),
+    }
+
+
 def _load(conn: psycopg.Connection, namespace: str) -> tuple[Profile, FaultPlan]:
     row = _one(
         conn, "SELECT profile, fault_plan FROM sim_namespaces WHERE namespace = %s", (namespace,)
@@ -104,14 +156,71 @@ def _load(conn: psycopg.Connection, namespace: str) -> tuple[Profile, FaultPlan]
     return Profile(row["profile"]), FaultPlan.model_validate(row["fault_plan"])
 
 
-def _next_call(conn: psycopg.Connection, namespace: str, counter: str) -> int:
+def _claim_call(
+    conn: psycopg.Connection,
+    namespace: str,
+    endpoint: str,
+    counter: str,
+    key: Any,
+    request: dict[str, Any],
+) -> tuple[int, int]:
+    """Consume the next fault-schedule slot and record the attempt, in one statement.
+
+    The counter increment and an in-flight call-log row are a single atomic statement,
+    so a slot can never be consumed without a record of the attempt, whatever happens
+    afterwards (an exception, or a worker killed inside a barrier). No lock is taken
+    and no transaction stays open. Returns (call_index, call_log id); the row is
+    finalised by _finish_call once the result is known.
+    """
     query = sql.SQL(
-        "UPDATE sim_namespaces SET {c} = {c} + 1 WHERE namespace = %s RETURNING {c} AS n"
+        "WITH claimed AS ("
+        " UPDATE sim_namespaces SET {c} = {c} + 1 WHERE namespace = %s RETURNING {c} AS n)"
+        " INSERT INTO call_log (namespace, endpoint, call_index, idempotency_key, request,"
+        " http_status, response, outcome, server_ms)"
+        " SELECT %s::text, %s::text, n, %s::text, %s, 0, '{{}}'::jsonb, %s::text, 0"
+        " FROM claimed RETURNING id, call_index"
     ).format(c=sql.Identifier(counter))
-    row = _one(conn, query, (namespace,))
+    row = _one(
+        conn,
+        query,
+        (
+            namespace,
+            namespace,
+            endpoint,
+            key if isinstance(key, str) else None,
+            Jsonb(request),
+            IN_FLIGHT,
+        ),
+    )
     if row is None:
         raise UnknownNamespace(namespace)
-    return row["n"]
+    return row["call_index"], row["id"]
+
+
+def _finish_call(
+    conn: psycopg.Connection, log_id: int, resp: SimResponse, outcome: str, started: float
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE call_log SET http_status = %s, response = %s, outcome = %s, server_ms = %s"
+            " WHERE id = %s",
+            (
+                resp.http_status,
+                Jsonb(resp.body),
+                outcome,
+                (time.perf_counter() - started) * 1000.0,
+                log_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("call log row vanished; was the namespace reset mid-call?")
+
+
+def _abort_call(conn: psycopg.Connection, log_id: int, started: float) -> None:
+    """Best effort: turn an in-flight row into a server_error record, never mask the cause."""
+    resp = _error(500, "internal_error", SERVER_ERROR_MESSAGE)
+    with contextlib.suppress(psycopg.Error, RuntimeError):
+        _finish_call(conn, log_id, resp, SERVER_ERROR, started)
 
 
 def _validate_charge(profile: Profile, payload: dict[str, Any]) -> _ValidCharge | SimResponse:
@@ -261,14 +370,22 @@ def charge(
             started,
         )
         return valid
-    call_index = _next_call(conn, namespace, "charge_calls")
-    fault = plan.charge_fault(call_index)
-    if fault == "error_no_commit":
-        resp, outcome = _ambiguous_error(profile, committed=False), "error_no_commit"
-    else:
-        row, inserted = _insert_or_get(conn, namespace, valid, call_index)
-        resp, outcome = _charge_result(profile, fault, valid, row, inserted)
-    _log(conn, namespace, "charge", call_index, valid.key, payload, resp, outcome, started)
+    call_index, log_id = _claim_call(conn, namespace, "charge", "charge_calls", valid.key, payload)
+    try:
+        fault = plan.charge_fault(call_index)
+        if call_index in plan.hold_before_commit:
+            hold(conn, namespace, f"before_commit:{call_index}", barrier_timeout_s)
+        if fault == "error_no_commit":
+            resp, outcome = _ambiguous_error(profile, committed=False), "error_no_commit"
+        else:
+            row, inserted = _insert_or_get(conn, namespace, valid, call_index)
+            if call_index in plan.hold_after_commit:
+                hold(conn, namespace, f"after_commit:{call_index}", barrier_timeout_s)
+            resp, outcome = _charge_result(profile, fault, valid, row, inserted)
+    except Exception:
+        _abort_call(conn, log_id, started)
+        raise
+    _finish_call(conn, log_id, resp, outcome, started)
     return resp
 
 
@@ -276,22 +393,26 @@ def status(conn: psycopg.Connection, namespace: str, key: str) -> SimResponse:
     _require_autocommit(conn)
     started = time.perf_counter()
     _, plan = _load(conn, namespace)
-    call_index = _next_call(conn, namespace, "status_calls")
-    if call_index <= plan.status_unavailable_calls:
-        resp, outcome = _error(503, "unavailable", STATUS_UNAVAILABLE_MESSAGE), "unavailable"
-    else:
-        row = _one(
-            conn,
-            "SELECT * FROM charges WHERE namespace = %s AND idempotency_key = %s",
-            (namespace, key),
-        )
-        if row is None:
-            body = {"idempotency_key": key, "status": "NOT_FOUND", "charge": None}
-            resp, outcome = SimResponse(200, body), "not_found"
-        else:
-            body = {"idempotency_key": key, "status": "SUCCEEDED", "charge": _charge_json(row)}
-            resp, outcome = SimResponse(200, body), "succeeded"
-    _log(
-        conn, namespace, "status", call_index, key, {"idempotency_key": key}, resp, outcome, started
+    call_index, log_id = _claim_call(
+        conn, namespace, "status", "status_calls", key, {"idempotency_key": key}
     )
+    try:
+        if call_index <= plan.status_unavailable_calls:
+            resp, outcome = _error(503, "unavailable", STATUS_UNAVAILABLE_MESSAGE), "unavailable"
+        else:
+            row = _one(
+                conn,
+                "SELECT * FROM charges WHERE namespace = %s AND idempotency_key = %s",
+                (namespace, key),
+            )
+            if row is None:
+                body = {"idempotency_key": key, "status": "NOT_FOUND", "charge": None}
+                resp, outcome = SimResponse(200, body), "not_found"
+            else:
+                body = {"idempotency_key": key, "status": "SUCCEEDED", "charge": _charge_json(row)}
+                resp, outcome = SimResponse(200, body), "succeeded"
+    except Exception:
+        _abort_call(conn, log_id, started)
+        raise
+    _finish_call(conn, log_id, resp, outcome, started)
     return resp
