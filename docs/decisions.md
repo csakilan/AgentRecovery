@@ -194,3 +194,31 @@ The batch ends after Task 5. Tasks 6 onward are not authorized by this batch.
 The changes were initially left uncommitted at the user's review checkpoint.
 The user subsequently authorized committing and pushing the batch on
 2026-10-05. Work remains stopped after Task 5.
+
+## D9. The simulator's call-counter ordering is Task 8's problem
+
+**Date:** 2026-10-08
+**Status:** accepted by the user
+
+Task 7's review found that `charge()` increments the per-namespace call counter
+and commits it before doing the work and before writing the call log. Any
+exception between the increment and the log silently consumes a fault-schedule
+slot while leaving no record that an attempt happened. That matters because the
+attempt count feeds a published metric, the legacy score's `n_charge_attempts`
+and `reused_key_on_retry`.
+
+Fixing it requires restructuring `charge()`, whose structure the Task 7 brief
+prescribes, so it was escalated rather than changed silently.
+
+The user chose to fold it into Task 8 rather than fix it first or accept it.
+
+Reason: Task 8 adds the synchronized barrier that pauses a request in exactly
+that window, so Task 8 must decide the ordering regardless. Doing it there is
+one change instead of two, and Task 8 can write a test that demonstrates the
+problem, which is awkward before barriers exist.
+
+**Binding requirement on Task 8.** Task 8 must resolve the ordering so that a
+consumed fault-schedule slot and the call-log record cannot disagree, and must
+carry a test that injects a failure between the increment and the log. The
+barrier's placement relative to the counter increment is part of that decision.
+Task 8 is not complete while this is open.

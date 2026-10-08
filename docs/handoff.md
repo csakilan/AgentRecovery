@@ -122,8 +122,8 @@ test while Docker was down.
 | 4. Episode manifests and matrices | Complete; all four coverage findings addressed and reviewed |
 | 5. Oracle scoring | Complete; reviewed, six findings fixed, re-review accepted |
 | 6. Database helpers, simulator schema, fixtures | Complete; reviewed, one finding fixed, re-review accepted |
-| 7. Simulator charge and status logic | **Not started. Next task** |
-| 8. Concurrency guarantee and commit barriers | Not started |
+| 7. Simulator charge and status logic | Complete; reviewed, three findings fixed, one folded into Task 8 (D9) |
+| 8. Concurrency guarantee and commit barriers | **Not started. Next task. Carries a binding requirement from D9** |
 | 9. Public and internal HTTP apps | Not started |
 | 10. Ledger reader and RetryLedger parity | Not started. See the `Decimal` caveat below |
 | 11. Container, compose, CI, protocol document | Not started |
@@ -132,10 +132,15 @@ Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
 
-## Current stop: Task 6 complete and reviewed
+## Current stop: Task 7 complete and reviewed
 
-Tasks 1 to 6 are done, each through both gates. Task 7, the simulator's charge
-and status logic, is next and nothing blocks it. Postgres is running.
+Tasks 1 to 7 are done, each through both gates. Task 8, the concurrency
+guarantee and the synchronized commit barriers, is next. Postgres is running.
+
+Task 8 carries a binding requirement from D9: it must fix the call-counter
+ordering described under "Task 7 review" below, with a test that injects a
+failure between the counter increment and the call log. Task 8 is not complete
+while that is open.
 
 Task 5 adds frozen ledger record types and pure scoring functions. It does not
 read Postgres yet; the read-only ledger reader belongs to Task 10. Its production
@@ -317,6 +322,62 @@ later migration that adds a table the evaluator must read has to carry its own
 explicit `GRANT SELECT ... TO ledger_reader`. Without it the evaluator is simply
 blind to that table, and nothing will fail loudly to tell you.
 
+## Task 7 review, 2026-10-08: the exactly-once guarantee, verified
+
+Task 7 is where the project's central guarantee lives and where its experimental
+design is encoded, so the review combined empirical testing against the live
+database with mutation testing of the implementation: 18 mutations, of which the
+suite as committed caught only 8.
+
+Spec compliance was proven mechanically rather than by eye. The reviewer
+extracted the brief's fenced code blocks, ran the formatter on them, and diffed
+against the commit; both diffs were empty, so reformatting altered no string,
+status code, error code, field name, SQL text or test case.
+
+**The atomic insert is correct, and its docstring's reasoning holds.** Under READ
+COMMITTED, a concurrent same-key insert blocked on the first transaction (611 ms
+observed), then took the `DO NOTHING` branch, and the following `SELECT` returned
+the winner's row carrying the winner's `args_hash`. Where the first transaction
+rolls back instead, the second insert wins. The `SELECT` can return `None` only
+if the row is deleted inside that window, and `charges` rows are deleted solely
+by the cascade from `configure_namespace` or `delete_namespace`, so the
+`RuntimeError` path is unreachable except by a namespace reset. Twelve two-thread
+trials of the real `charge` produced exactly one effect every time, and sixteen
+concurrent `_next_call` calls returned exactly 1 to 16 with no duplicate.
+
+**The profile split is correct.** In `controlled`, `lost_ack`, `true_fail` and
+`permanent_fail` all return HTTP 504 with byte-identical bodies and identical
+rendered text, while their ledgers hold one charge, zero and zero. In `compat`,
+`lost_ack` gives 504 with the timeout message and `true_fail` gives 500
+`internal_error` with the not-processed message. Key reuse with changed arguments
+gives 409 `idempotency_conflict` in `controlled` and a 200 replay in `compat`.
+
+**One Critical finding, fixed in `f1f2972`.** None of that indistinguishability
+was asserted. A variant giving the two worlds different error codes and messages
+passed all 134 tests, which would have silently destroyed the behavior study's
+premise. The tests now compare bodies as a set of `json.dumps(sort_keys=True)`
+strings across three worlds, assert the rendered text the model sees, and assert
+the ledgers differ. A `compat` mirror pins that the worlds ARE distinguishable
+there, since that profile reproduces the original project deliberately. A
+re-review reproduced the subtle variant independently: keeping 504 while changing
+only the error code or only the message is caught by the new body-level
+assertions and by nothing else.
+
+Also fixed: four message constants had no literal coverage, and two assertions
+compared a constant against itself and so could never fail. All four are now
+pinned to literals written in the test and verified by AST comparison against the
+constants. All ten call-log outcome labels, the `NOT_FOUND` 200, `order_id` in a
+success body, the `gateway_timeout` code, `status()`'s autocommit guard and
+`delete_namespace` are now covered.
+
+**One finding deliberately left open for Task 8, per D9.** `charge()` increments
+the per-namespace call counter and commits it before doing the work and before
+writing the call log, so any exception in between consumes a fault-schedule slot
+while leaving no record of the attempt. That skews `n_charge_attempts` and
+`reused_key_on_retry`, both of which are reported metrics. Task 8's barrier wait
+lands in exactly that window, so Task 8 owns the fix and must carry a test that
+injects a failure between the increment and the log.
+
 ## How the work has been run
 
 Task by task, strictly test-first: write the test, run it and watch it fail for
@@ -392,6 +453,9 @@ unreachable today because each test session mints its own database. `CHARGE`,
 `COMPAT_CHARGE`, `charges()` and the `conn` fixture are committed unreferenced;
 they are plan-mandated for Task 7, which is where they first get used. No test
 asserts that the reader's SELECT on `barriers` is denied, only its writes.
+
+**Task 7.** The invalid-request logging path can raise `TypeError` on a payload
+the validator has just rejected, for instance one carrying a `Decimal`.
 
 ## One ruling already made
 
