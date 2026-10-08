@@ -1,6 +1,6 @@
 # Handoff
 
-**Updated:** 2026-10-05. **For:** the next assistant or developer to pick this up,
+**Updated:** 2026-10-08. **For:** the next assistant or developer to pick this up,
 with no access to the conversation that produced it. Everything needed is in this
 repository.
 
@@ -89,45 +89,49 @@ The pre-existing untracked `.DS_Store` was left alone.
 | `f80d0d6` | Docs: consolidate the handoff |
 | `b39c4cb` | Task 4: pin manifest seeds, IDs, scoring flags and schema restrictions |
 | `01805eb` | Task 5: legacy and extended oracle scoring, with regression tests |
+| `d0bb878` | Docs: Task 5 checkpoint and publishing approval |
+| `f35375c` | Task 5 fix wave: close six review findings (see below) |
 
-Verification on 2026-10-05:
+Verification on 2026-10-08, after starting Docker:
 
-- Unit suite: **72 passed** (22 task-argument, 7 fault/render, 20 manifest,
-  23 scoring cases).
-- Full suite: **72 passed, 1 failed**. The failure is
-  `tests/test_environment.py::test_postgres_16_is_reachable`: the local server on
-  port 54329 closes the connection unexpectedly. The full suite is not green.
+- Full suite: **90 passed, 0 failed.** Green for the first time, including
+  `tests/test_environment.py::test_postgres_16_is_reachable`.
 - Python lint and formatting checks pass.
-- Nine intentional manifest regressions and four scoring regressions were
-  caught by tests. The mutations ran only in child-process memory; no broken
-  source file was written.
-- Task 5's tests were run before implementation and failed at collection with
-  `ModuleNotFoundError: No module named 'lab.oracle'`.
+- The Oct 5 batch (`b39c4cb` + `01805eb`) received its first independent review
+  on 2026-10-08: spec compliance passed, quality approved, no Critical issues and
+  no vacuous tests. The reviewer verified all six load-bearing scoring semantics
+  by execution and confirmed all eight manifest mutations are caught, so D8's
+  four findings are genuinely closed.
+- That review raised six Important findings, all closed by `f35375c` and
+  confirmed ADDRESSED by a scoped re-review that reproduced each break itself in
+  a scratch copy. Details under "Task 5 review" below.
+
+Superseded earlier figures, kept so the record is legible: on 2026-10-05 the
+suite was 72 passed with 1 failure, the failure being the database reachability
+test while Docker was down.
 
 | Task | State |
 |---|---|
 | 1. Scaffold and environment test | Complete, review clean |
 | 2. Task constants and canonical arguments | Complete, review clean |
 | 3. Hidden fault plans and observation text | Complete, review clean |
-| 4. Episode manifests and matrices | Committed; all four coverage findings addressed |
-| 5. Oracle scoring | Implemented, tested and committed |
-| 6. Database helpers, simulator schema, fixtures | Not started, needs Postgres |
-| 7. Simulator charge and status logic | Not started, needs Postgres |
-| 8. Concurrency guarantee and commit barriers | Not started, needs Postgres |
-| 9. Public and internal HTTP apps | Not started, needs Postgres |
-| 10. Ledger reader and RetryLedger parity | Not started, needs Postgres |
-| 11. Container, compose, CI, protocol document | Not started, needs Postgres |
+| 4. Episode manifests and matrices | Complete; all four coverage findings addressed and reviewed |
+| 5. Oracle scoring | Complete; reviewed, six findings fixed, re-review accepted |
+| 6. Database helpers, simulator schema, fixtures | **Not started. Next task. Postgres is now up** |
+| 7. Simulator charge and status logic | Not started |
+| 8. Concurrency guarantee and commit barriers | Not started |
+| 9. Public and internal HTTP apps | Not started |
+| 10. Ledger reader and RetryLedger parity | Not started. See the `Decimal` caveat below |
+| 11. Container, compose, CI, protocol document | Not started |
 
 Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
 
-## Current stop: Task 5 completed; publishing authorized
+## Current stop: Task 5 complete and reviewed
 
-The user initially asked to stop after Task 5, run the tests, and leave the
-changes for their review before committing. On 2026-10-05, they subsequently
-authorized committing and pushing the changes. Task 6 has not been started.
-No independent code review of this batch has been performed.
+Tasks 1 to 5 are done, each through both gates. Task 6 has not been started and
+is the next implementation task. Postgres is running, so nothing blocks it.
 
 Task 5 adds frozen ledger record types and pure scoring functions. It does not
 read Postgres yet; the read-only ledger reader belongs to Task 10. Its production
@@ -150,36 +154,44 @@ The accepted matrices are 48 behavior episodes plus 144 infrastructure episodes,
 192 total and at most 1152 model requests at six turns each, excluding the pilot
 and rerun reserve. D1's older arithmetic has been reconciled with D4.
 
-The next implementation task is Task 6; the user has not asked to begin it.
-It needs working Postgres. The roadmap and detailed plan still contain their
-historical planning-only status labels; this file records current progress.
+The next implementation task is Task 6. The roadmap and detailed plan still
+contain their historical planning-only status labels; this file records current
+progress.
 
-## Blocker one: Docker, and the user owns it
+## The Docker blocker: resolved on 2026-10-08
 
-Docker Desktop's container runtime is wedged on this machine. The Postgres
-container reports healthy because its healthcheck runs inside Docker's VM, while
-the path from the host into that VM is broken.
+Kept as a record, because the diagnosis changed and the change is instructive.
 
-Evidence gathered: a TCP connection to port 54329 opens instantly on both IPv4
-and IPv6 and is then closed with an empty reply, so the proxy accepts and drops
-it; `docker exec` and `docker restart` both hang indefinitely; `docker version`
-answers in 0.09s. Restarting only the project's container does not work, because
-that is one of the hanging commands.
+On 2026-10-04 Docker Desktop's container runtime was genuinely wedged. A TCP
+connection to port 54329 opened instantly on both IPv4 and IPv6 and was then
+closed with an empty reply, so the proxy accepted and dropped it. `docker exec`,
+`docker restart` and `docker compose ps` all hung indefinitely while
+`docker version` answered in 0.09s. The container reported healthy throughout,
+because its healthcheck runs inside Docker's VM and so cannot see a broken path
+from the host. Restarting only the project's container was impossible, that being
+one of the hanging commands.
 
-The original diagnosis above was recorded on 2026-10-04. On 2026-10-05, the
-connectivity test was rerun from the host and still failed with an unexpectedly
-closed connection on both IPv4 and IPv6. Docker Desktop was not restarted.
+By 2026-10-08 the symptom had changed from "connection closed unexpectedly" to
+"connection refused", which is a different fault: the daemon was simply not
+running, the wedge having cleared in between. `kind-registry` was also down, so
+the collateral-damage concern that had made the user own the restart no longer
+applied, and they approved starting Docker.
 
-The remedy is restarting Docker Desktop, which also bounces the user's unrelated
-`kind-registry` container. **The user chose to do this themselves.** Do not
-restart Docker Desktop without asking them again. Once they confirm:
+A plain start was enough. `docker compose up -d --wait postgres` completed in
+seconds and reported Healthy, and `kind-registry` came back on its own. No
+jammed-VM recovery was needed.
+
+Lesson for a successor: distinguish refused from closed. Refused means nothing is
+listening. Closed after connecting means something accepted and dropped it, which
+on Docker for Mac points at the port-forwarding path rather than at the database.
+A container's own healthcheck cannot tell you the difference.
+
+To bring the database up from cold:
 
 ```bash
 docker compose up -d --wait postgres
-uv run pytest tests/test_environment.py -v
+uv run pytest -q          # expect 90 passed
 ```
-
-Expect a pass. Tasks 6 to 11 are then unblocked.
 
 ## Task 4 review findings: addressed
 
@@ -211,7 +223,49 @@ scoring flags, and enforce frozen/extra-forbidden behavior on both models.
 
 All nine deliberate mutations covering these findings were caught. Task 4's
 production code was not modified. The decision is resolved, and the user
-authorized committing and pushing the coverage changes.
+authorized committing and pushing the coverage changes. The 2026-10-08 review
+independently re-confirmed all four by mutation.
+
+## Task 5 review, 2026-10-08: six findings, all closed
+
+The oracle's first independent review passed spec compliance and approved
+quality, then raised six Important findings. Four were the same species as Task
+4's: correct code with nothing to catch it changing. Two were genuine defects.
+All six are closed by `f35375c` and were confirmed ADDRESSED by a scoped
+re-review that reproduced each break itself rather than trusting the fixer.
+
+Coverage findings, production code unchanged, now pinned by tests:
+
+1. `score_episode` could ignore its `calls` argument entirely. Every test had
+   passed the same default `CallSummary`.
+2. `checked_status` could return the raw count instead of a 0/1 flag. Now pinned
+   at 5 and 1 mapping to 1, and 0 to 0. This would have surfaced much later as a
+   Task 10 parity failure against the original RetryLedger score.
+3. The `>= 2` guard on `reused_key_on_retry` could be dropped, reporting a retry
+   after a single attempt.
+4. The `n_intended == 1` conjunct in `truthful_report` could be dropped, so an
+   agent that charged the wrong amount and claimed success would read as having
+   told the truth. The most consequential of the four.
+
+Defects, production code changed:
+
+5. `normalize_claim` raised `AttributeError` on a non-string claim rather than
+   returning `Claim.NONE`, aborting scoring instead of recording an unknown
+   claim. Fixed to an `isinstance` check. The re-review confirmed identical
+   behaviour on 67 string and `None` inputs, covering case, whitespace and
+   near-misses. The brief's `str | None` annotation was kept; the runtime
+   tolerance is deliberate, because model output is untrusted.
+6. `LedgerCharge.amount` accepted a float or string and then silently scored
+   `WRONG_EFFECT`, turning a type error into a wrong result. Now a
+   `__post_init__` raises `TypeError` for a non-`Decimal`. It remains a frozen
+   dataclass; assignment still raises, and equality, hash and `replace` are
+   unchanged.
+
+**Caveat for Task 10.** `LedgerCharge` now rejects `int` and `bool` amounts as
+well as floats, so `read_ledger` must build a `Decimal` explicitly from database
+values rather than passing a raw row value through. Postgres `NUMERIC` comes back
+from psycopg as `Decimal` already, so this should be a non-event, but construct
+it explicitly rather than relying on that.
 
 ## How the work has been run
 
@@ -264,7 +318,19 @@ today by construction. The Task 3 report's line numbers are inaccurate.
 **Task 4.** The determinism test cannot distinguish a private generator from a
 seeded global one. The infrastructure matrix test does not assert worlds or
 profile. `Manifest.write()` does not create parent directories, which the brief
-did not ask it to.
+did not ask it to. The manifest digest assertion compares two bare hex strings,
+so a failure gives no hint of the cause.
+
+**Task 5.** `legacy_score` counts ledger rows rather than distinct idempotency
+keys, which leaves Task 10's parity resting on an unstated invariant: that the
+simulator never writes two rows for one key. The simulator's unique constraint
+will enforce that from Task 6 onward, so the invariant holds, but nothing in the
+oracle asserts it. `_truthful`'s `case _` wildcard would silently absorb a future
+`Claim` member. `LedgerCharge.idempotency_key` and `call_index` are read by no
+scoring path yet; Task 10 populates them. The new eligibility test derives its
+inputs from `spec.expect_effect`, so its `correct_recovery` half cannot detect a
+flag flip. `Decimal("NaN")` is still accepted as an amount, though it fails safe
+as `WRONG_EFFECT`.
 
 ## One ruling already made
 
