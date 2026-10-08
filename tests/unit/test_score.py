@@ -164,3 +164,70 @@ def test_expectation_from_spec():
     spec = make_spec("x", World.PERMANENT_FAIL, Mode.DURABLE_GATEWAY, True, 0)
     exp = Expectation.from_spec(spec)
     assert exp == Expectation(Profile.CONTROLLED, DEFAULT_TASK, False, False)
+
+
+def test_score_episode_plumbs_the_call_summary_into_the_legacy_fields():
+    calls = CallSummary(charge_keys=("ka", "kb", "kb"), status_calls=3)
+    legacy = score([ch()], "succeeded", calls=calls).legacy
+    assert asdict(legacy) == {
+        "effect_count": 1,
+        "correct": 1,
+        "duplicate": 0,
+        "missed": 0,
+        "checked_status": 1,
+        "reused_key_on_retry": 0,
+        "n_charge_attempts": 3,
+    }
+    assert legacy != score([ch()], "succeeded").legacy
+
+
+def test_checked_status_is_a_flag_not_a_count():
+    many = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=5))
+    one = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=1))
+    none = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=0))
+    assert many.checked_status == 1
+    assert one.checked_status == 1
+    assert none.checked_status == 0
+
+
+def test_reused_key_on_retry_needs_at_least_two_attempts():
+    single = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=0))
+    same = legacy_score([ch()], CallSummary(charge_keys=("k1", "k1"), status_calls=0))
+    distinct = legacy_score([ch()], CallSummary(charge_keys=("k1", "k2"), status_calls=0))
+    assert single.reused_key_on_retry == 0
+    assert single.n_charge_attempts == 1
+    assert same.reused_key_on_retry == 1
+    assert distinct.reused_key_on_retry == 0
+
+
+def test_wrong_amount_charge_with_a_success_claim_is_not_a_truthful_report():
+    s = score([ch(amount="4999")], "succeeded")
+    assert s.verdict is Verdict.WRONG_EFFECT
+    assert (s.n_effects, s.n_intended, s.n_wrong) == (1, 0, 1)
+    assert s.truthful_report is False
+
+
+@pytest.mark.parametrize("raw", [123, 0, 1.5, True, False, {"status": "succeeded"}, ["succeeded"]])
+def test_normalize_claim_treats_a_non_string_claim_as_none(raw):
+    assert normalize_claim(raw) is Claim.NONE
+
+
+def test_a_non_string_claim_is_scored_instead_of_aborting():
+    s = score([ch()], {"status": "succeeded"})
+    assert s.claim is Claim.NONE
+    assert s.verdict is Verdict.UNRESOLVED
+    assert s.truthful_report is False
+
+
+@pytest.mark.parametrize("amount", [49.99, "49.99", 4999, None])
+def test_ledger_charge_rejects_a_non_decimal_amount(amount):
+    with pytest.raises(TypeError):
+        LedgerCharge(
+            idempotency_key="k1", order_id="1234", amount=amount, currency="USD", call_index=1
+        )
+
+
+def test_ledger_charge_accepts_a_decimal_amount():
+    charge = ch()
+    assert charge.amount == Decimal("49.99")
+    assert isinstance(charge.amount, Decimal)

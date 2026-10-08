@@ -75,7 +75,13 @@ class EpisodeScore:
 
 
 def normalize_claim(raw: str | None) -> Claim:
-    if raw is None:
+    """Map an untrusted claim to a Claim.
+
+    Model output is untrusted, so a value that is not a string at runtime (an int, a bool,
+    a dict, a list) is Claim.NONE instead of an error, even though the annotation says
+    str | None.
+    """
+    if not isinstance(raw, str):
         return Claim.NONE
     value = raw.strip().lower()
     if value in {c.value for c in (Claim.SUCCEEDED, Claim.FAILED, Claim.UNRESOLVED)}:

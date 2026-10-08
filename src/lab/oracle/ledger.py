@@ -14,6 +14,10 @@ class LedgerCharge:
     currency: str | None
     call_index: int
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.amount, Decimal):
+            raise TypeError(f"amount must be a Decimal, got {type(self.amount).__name__}")
+
 
 @dataclass(frozen=True)
 class CallSummary:
