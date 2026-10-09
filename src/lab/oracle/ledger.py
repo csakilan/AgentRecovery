@@ -44,6 +44,13 @@ ORDER BY call_index
 """
 
 
+def _require_autocommit(conn: psycopg.Connection) -> None:
+    # The same rule the simulator enforces; kept local so the oracle never imports the
+    # agent-side service module.
+    if not conn.autocommit:
+        raise ValueError("ledger connections must use autocommit=True")
+
+
 def read_ledger(conn: psycopg.Connection, namespace: str) -> tuple[list[LedgerCharge], CallSummary]:
     """Read committed effects and call counts for one namespace.
 
@@ -56,7 +63,11 @@ def read_ledger(conn: psycopg.Connection, namespace: str) -> tuple[list[LedgerCh
     the start of each charge call, so a crashed attempt still counts. Calls rejected by
     validation get no call_index and are not attempts. Results are ordered by call_index,
     the order slots were claimed, never by row id or by when a call finished.
+
+    The connection must be in autocommit mode (ValueError otherwise): a read on a
+    non-autocommit connection would silently leave a transaction open.
     """
+    _require_autocommit(conn)
     with conn.cursor(row_factory=dict_row) as cur:
         rows = cur.execute(_READ_SQL, {"ns": namespace}).fetchall()
     found = [

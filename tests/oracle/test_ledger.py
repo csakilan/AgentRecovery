@@ -65,13 +65,44 @@ def test_read_ledger_ignores_other_namespaces(conn):
     assert calls == CallSummary(charge_keys=(), status_calls=0)
 
 
-def test_read_ledger_amounts_are_decimals_not_floats(conn):
+def test_read_ledger_amount_column_is_numeric_and_reads_back_as_decimal(conn):
     service.configure_namespace(conn, "ns", Profile.CONTROLLED, world_fault_plan(World.HEALTHY))
     service.charge(conn, "ns", {**CHARGE, "amount": 0.1})
     service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k2", "amount": 49.99})
     found, _ = read_ledger(conn, "ns")
     assert [type(c.amount) for c in found] == [Decimal, Decimal]
     assert [c.amount for c in found] == [Decimal("0.1"), Decimal("49.99")]
+
+
+def test_read_ledger_constructs_decimals_even_when_the_driver_hands_back_floats(payments_db, conn):
+    """The Decimal is built by the reader, not trusted from the driver.
+
+    psycopg returns Decimal for NUMERIC, so the old test could not tell construction from
+    passthrough. Here the cursor is made to return a float; the reader must still yield
+    the exact Decimal (via str, so 0.1 is Decimal("0.1"), not the binary expansion).
+    """
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, world_fault_plan(World.HEALTHY))
+    service.charge(conn, "ns", {**CHARGE, "amount": 0.1})
+
+    class FloatAmountCursor(psycopg.Cursor):
+        def fetchall(self):
+            return [
+                {**r, "amount": float(r["amount"])} if r["kind"] == "charge" else r
+                for r in super().fetchall()
+            ]
+
+    with psycopg.connect(
+        payments_db["reader"], autocommit=True, cursor_factory=FloatAmountCursor
+    ) as reader:
+        found, _ = read_ledger(reader, "ns")
+    assert [c.amount for c in found] == [Decimal("0.1")]
+    assert type(found[0].amount) is Decimal
+
+
+def test_ledger_charge_rejects_a_non_decimal_amount():
+    """The safety net behind the reader: a float that reached LedgerCharge would raise."""
+    with pytest.raises(TypeError, match="amount must be a Decimal"):
+        LedgerCharge("k1", "1234", 0.1, "USD", 1)  # type: ignore[arg-type]
 
 
 def test_a_crashed_attempt_still_counts_as_a_charge_attempt(conn, monkeypatch):
@@ -95,17 +126,37 @@ def test_a_crashed_attempt_still_counts_as_a_charge_attempt(conn, monkeypatch):
     assert (score.n_charge_attempts, score.reused_key_on_retry) == (2, 1)
 
 
-def test_a_failed_compat_attempt_counts_without_filtering_on_outcome(conn):
-    service.configure_namespace(conn, "ns", Profile.COMPAT, world_fault_plan(World.TRUE_FAIL))
-    service.charge(conn, "ns", dict(COMPAT_CHARGE))  # first call fails, nothing committed
-    outcomes = [
-        r["outcome"]
-        for r in conn.execute("SELECT outcome FROM call_log WHERE namespace = 'ns'").fetchall()
-    ]
-    assert outcomes == ["error_no_commit"]
-    found, calls = read_ledger(conn, "ns")
-    assert found == []
-    assert legacy_score(found, calls).n_charge_attempts == 1
+def test_a_failed_compat_attempt_counts_without_filtering_on_outcome(payments_db, svc_url, conn):
+    """One episode holding an error_no_commit, a server_error and an in_flight attempt."""
+    plan = FaultPlan(charge={1: "error_no_commit"}, hold_before_commit=(3,))
+    service.configure_namespace(conn, "ns", Profile.COMPAT, plan)
+    service.charge(conn, "ns", dict(COMPAT_CHARGE))  # 1: fails, nothing committed
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(service, "_insert_or_get", _boom)
+        with pytest.raises(RuntimeError, match="injected failure"):
+            service.charge(conn, "ns", {**COMPAT_CHARGE, "idempotency_key": "k2"})  # 2: crash
+    thread, result = _charge_in_background(
+        svc_url, "ns", {**COMPAT_CHARGE, "idempotency_key": "k3"}
+    )
+    try:
+        _wait_until(lambda: service.barrier_state(conn, "ns", "before_commit:3")["reached"])
+        outcomes = [
+            r["outcome"]
+            for r in conn.execute(
+                "SELECT outcome FROM call_log WHERE namespace = 'ns' ORDER BY call_index"
+            ).fetchall()
+        ]
+        assert outcomes == ["error_no_commit", "server_error", "in_flight"]  # the premise
+
+        with psycopg.connect(payments_db["reader"], autocommit=True) as reader:
+            found, calls = read_ledger(reader, "ns")
+        assert found == []
+        assert calls == CallSummary(charge_keys=("k1", "k2", "k3"), status_calls=0)
+        assert legacy_score(found, calls).n_charge_attempts == 3
+    finally:
+        service.release_barrier(conn, "ns", "before_commit:3")
+        thread.join(5)
+    assert result["response"].http_status == 200
 
 
 def test_read_ledger_during_a_request_counts_the_attempt_but_not_yet_the_effect(
@@ -166,3 +217,43 @@ def test_read_ledger_orders_by_claim_not_by_completion(payments_db, svc_url, con
         found, calls = read_ledger(reader, "ns")
     assert [(c.idempotency_key, c.call_index) for c in found] == [("k1", 1), ("k2", 2)]
     assert calls.charge_keys == ("k1", "k2")
+
+
+def test_read_ledger_requires_autocommit(payments_db):
+    with psycopg.connect(payments_db["reader"]) as c:
+        with pytest.raises(ValueError, match="autocommit"):
+            read_ledger(c, "ns")
+        assert c.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+
+def test_read_ledger_issues_exactly_one_sql_statement(payments_db, conn):
+    """Both halves of the read must share one snapshot, which means one statement.
+
+    A single SELECT sees one snapshot; two separate statements could straddle a commit and
+    report an effect without its attempt. Counting executions pins that structurally.
+    """
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, FaultPlan())
+    service.charge(conn, "ns", dict(CHARGE))
+    service.status(conn, "ns", "k1")
+
+    executed: list[str] = []
+
+    class CountingCursor(psycopg.Cursor):
+        def execute(self, query, *args, **kwargs):
+            executed.append(str(query))
+            return super().execute(query, *args, **kwargs)
+
+        def executemany(self, query, *args, **kwargs):
+            executed.append(str(query))
+            return super().executemany(query, *args, **kwargs)
+
+    with psycopg.connect(
+        payments_db["reader"], autocommit=True, cursor_factory=CountingCursor
+    ) as reader:
+        found, calls = read_ledger(reader, "ns")
+
+    # Both halves came back, so the one statement really did cover charges and call_log.
+    assert [c.idempotency_key for c in found] == ["k1"]
+    assert calls == CallSummary(charge_keys=("k1",), status_calls=1)
+    assert len(executed) == 1
+    assert "charges" in executed[0] and "call_log" in executed[0]

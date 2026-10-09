@@ -1,5 +1,6 @@
 from dataclasses import asdict
 
+import psycopg
 import pytest
 
 from lab.oracle.ledger import read_ledger
@@ -29,7 +30,7 @@ SEQUENCES = {
 
 @pytest.mark.parametrize("world", ["lost_ack", "true_fail"])
 @pytest.mark.parametrize("name", sorted(SEQUENCES))
-def test_compat_profile_reproduces_the_original_episode(conn, world, name):
+def test_compat_profile_reproduces_the_original_episode(payments_db, conn, world, name):
     original = RetryLedgerEpisode(world, verify=True)
     ns = f"parity-{world}-{name}"
     service.configure_namespace(conn, ns, Profile.COMPAT, world_fault_plan(World(world)))
@@ -43,7 +44,9 @@ def test_compat_profile_reproduces_the_original_episode(conn, world, name):
             expected, _ = original.handle("get_payment_status", {"idempotency_key": key})
             r = service.status(conn, ns, key)
             assert render_status(r.http_status, r.body) == expected
-    found, calls = read_ledger(conn, ns)
+    # Read through the read-only role the evaluator actually uses, not the agent-side one.
+    with psycopg.connect(payments_db["reader"], autocommit=True) as reader:
+        found, calls = read_ledger(reader, ns)
     assert asdict(legacy_score(found, calls)) == original.score()
 
 
