@@ -107,10 +107,10 @@ The pre-existing untracked `.DS_Store` was left alone.
 
 Verification on 2026-10-08, after starting Docker:
 
-- Full suite: **164 passed, 0 failed**, including
+- Full suite: **185 passed, 0 failed**, including
   `tests/test_environment.py::test_postgres_16_is_reachable`. The suite went
   green for the first time on this date, at 90 passed, then 109 after Task 6,
-  145 after Task 7 and 164 after Task 8.
+  145 after Task 7, 164 after Task 8 and 185 after Task 9.
 - Python lint and formatting checks pass.
 - The Oct 5 batch (`b39c4cb` + `01805eb`) received its first independent review
   on 2026-10-08: spec compliance passed, quality approved, no Critical issues and
