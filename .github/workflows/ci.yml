@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv publishes exact tags only (no floating v10), so the tag is pinned in full.
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.12.22"
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      # Python files only, as in docs/handoff.md. The formatter also reformats Python code
+      # blocks inside Markdown, and the planning documents under docs/superpowers/plans/
+      # are preserved as written, so the check must not cover docs/.
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run pytest
