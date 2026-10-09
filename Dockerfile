@@ -7,4 +7,8 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev
 ENV PATH="/app/.venv/bin:$PATH"
+# The virtualenv and bytecode are built as root and only read at runtime, so an unprivileged
+# user can run the services without owning /app.
+RUN useradd --system --uid 10001 --no-create-home simulator
+USER simulator
 CMD ["python", "-m", "lab.simulator", "public"]

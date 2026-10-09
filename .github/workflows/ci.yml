@@ -1,7 +1,14 @@
 name: ci
 
+# Read-only token: the job only checks out code and runs tests.
+permissions:
+  contents: read
+
+# Push runs only on the default branch; every other branch is covered by its pull request,
+# so a branch with an open PR does not run twice.
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -22,7 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # setup-uv publishes exact tags only (no floating v10), so the tag is pinned in full.
-      - uses: astral-sh/setup-uv@v10.3.0
+      # v10.2.0 is the newest release that has been public for a while.
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           version: "0.12.22"
       - run: uv sync --frozen

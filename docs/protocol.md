@@ -65,10 +65,20 @@ and the host-side publish stays on `127.0.0.1`, so it is reachable only from the
 - `GET /internal/namespaces/{namespace}/barriers/{name}` returns `reached` and `released`.
 - `POST /internal/namespaces/{namespace}/barriers/{name}/release` releases a barrier.
 
-Errors from the simulator use `{"error": {"code": ..., "message": ...}}`. A bad token is
-401 with FastAPI's `{"detail": "unauthorized"}`, a missing `X-Lab-Namespace` header is 422,
-and an unknown namespace is 404 `unknown_namespace`. Neither app publishes an OpenAPI
-schema.
+Errors the simulator produces itself use `{"error": {"code": ..., "message": ...}}`: 400
+`invalid_request`, 404 `unknown_namespace`, 409 `idempotency_conflict`, the scheduled
+fault errors (504 `gateway_timeout`, or 500 `internal_error` for a compat `true_fail`
+charge, and 503 `unavailable` for status), 503 `service_unavailable` and 500
+`unhandled_error`. Two kinds of error come from FastAPI instead and use its `detail` key. A bad token is 401 with
+`{"detail": "unauthorized"}`. A request FastAPI cannot parse is 422 with `{"detail": [...]}`,
+a list of objects with `type`, `loc`, `msg` and `input`: a missing `X-Lab-Namespace` header,
+a body that is not valid JSON or not a JSON object, or an invalid body on the control API's
+`PUT`.
+
+A namespace that does not exist is handled per route. `POST /v1/charges`,
+`GET /v1/payments/{idempotency_key}` and the barrier release endpoint answer 404
+`unknown_namespace`. `GET` on a barrier answers 200 with `reached` and `released` both false,
+and `DELETE` on the namespace answers 204. Neither app publishes an OpenAPI schema.
 
 ## Simulator contract
 
@@ -94,9 +104,11 @@ schema.
   rejected earlier, by authentication, a missing header, a body that is not a JSON object
   or an unknown namespace, also claims no slot.
 - Fault schedules are indexed from 1 by claimed call order within a namespace. Charge
-  calls and status calls have separate counters. A call claims its slot after validation
-  and before any other work, and a slot stays consumed even if the call later fails or
-  never finishes, so one failed call does not shift the schedule for the next.
+  calls and status calls have separate counters. A charge call claims its slot after
+  validation. A status call has no validation stage, so it claims its slot as soon as the
+  namespace is found. In both cases the claim comes before any ledger access, and a slot
+  stays consumed even if the call later fails or never finishes, so one failed call does not
+  shift the schedule for the next.
 - A request that fails before its slot is claimed (for example when no database
   connection can be acquired, answered with 503 `service_unavailable`) leaves no call-log
   row and is not counted as an attempt. This is a recorded limitation, not a handled case.
@@ -106,8 +118,12 @@ schema.
   `<n>` is the call's index in that namespace. A hold ends when the barrier is released or
   after 30 s, whichever comes first, and the request then continues normally. A barrier
   released in advance does not block, and each barrier is used at most once per
-  namespace. A before-commit hold happens before the fault is applied; an after-commit
-  hold happens only on a path that went through the ledger insert.
+  namespace. A before-commit hold happens before the fault is applied, so it also holds a
+  call scheduled for `error_no_commit`. An after-commit hold happens on every call that
+  reaches the ledger, meaning every call not scheduled for `error_no_commit`. That includes
+  a replay that inserts nothing and a 409 conflict, and the hold comes before the response
+  (including a `commit_then_error` response) is built. A call scheduled for
+  `error_no_commit` never reaches the ledger, so it never reaches an after-commit hold.
 - The control API, its token and the ledger reader role are never available to a model.
 
 ## Verdicts

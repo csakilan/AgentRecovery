@@ -1,3 +1,14 @@
+# Each simulator service receives only the variables it needs. sim-public is the service an
+# untrusted agent calls, so it must never hold the control token, the Postgres superuser URL
+# or the ledger reader password: those belong to the control plane and the evaluator.
+# Only the connection string is shared, because both HTTP services connect as payment_svc.
+x-sim-db-env: &sim-db-env
+  LAB_PAYMENTS_URL: postgresql://payment_svc:dev-payment-svc@postgres:5432/payments
+
+# One image for all three simulator services. sim-migrate owns the build; the other two
+# reuse the image through the shared name and depend on sim-migrate, so it is built first.
+x-sim-image: &sim-image lab-simulator:dev
+
 services:
   postgres:
     image: postgres:16
@@ -13,36 +24,65 @@ services:
       timeout: 3s
       retries: 30
 
+  # Control plane setup: creates roles and applies migrations, so it needs the superuser URL
+  # and both role passwords. It serves no HTTP and gets neither token.
   sim-migrate:
     build: .
+    image: *sim-image
     command: ["python", "-m", "lab.simulator", "migrate"]
-    environment: &sim-env
+    environment:
       LAB_PG_ADMIN_URL: postgresql://postgres:postgres@postgres:5432/postgres
       LAB_PAYMENTS_DB: payments
       LAB_PAYMENT_SVC_PASSWORD: dev-payment-svc
       LAB_LEDGER_READER_PASSWORD: dev-ledger-reader
-      LAB_PAYMENTS_URL: postgresql://payment_svc:dev-payment-svc@postgres:5432/payments
-      SIM_CLIENT_TOKEN: dev-client-token
-      SIM_CONTROL_TOKEN: dev-control-token
     depends_on:
       postgres:
         condition: service_healthy
 
+  # Agent-facing. Holds the client token and the payment_svc connection string, nothing else.
   sim-public:
-    build: .
+    image: *sim-image
     command: ["python", "-m", "lab.simulator", "public"]
-    environment: *sim-env
+    environment:
+      <<: *sim-db-env
+      SIM_CLIENT_TOKEN: dev-client-token
     ports:
       - "8100:8100"
     depends_on:
       sim-migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # Every route requires a token and neither app publishes an OpenAPI schema, so there is
+      # no unauthenticated route that returns 200. An unauthenticated request that comes back
+      # 401 is the expected answer and is deliberate proof of health: only a running uvicorn
+      # that routed the request to the app and ran its auth check can produce it. A refused
+      # connection, a timeout or any other status counts as unhealthy. The image has no curl.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.error, urllib.request
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8100/v1/payments/healthcheck", timeout=2)
+          except urllib.error.HTTPError as e:
+              sys.exit(0 if e.code == 401 else 1)
+          except Exception:
+              sys.exit(1)
+          sys.exit(1)
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
+  # Control plane. Holds the control token and the payment_svc connection string, and no
+  # client token.
   sim-internal:
-    build: .
+    image: *sim-image
     command: ["python", "-m", "lab.simulator", "internal"]
     environment:
-      <<: *sim-env
+      <<: *sim-db-env
+      SIM_CONTROL_TOKEN: dev-control-token
       # The app binds 127.0.0.1 by default so that exposure is opt-in. Inside a container
       # that address is unreachable from the published port, so bind all interfaces here
       # and keep the host-side publish on loopback: the control API stays host-local.
@@ -52,6 +92,27 @@ services:
     depends_on:
       sim-migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # Same reasoning as sim-public: an unauthenticated 401 proves uvicorn is listening
+      # and the auth dependency ran. Anything else, including a refused connection, is
+      # unhealthy.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.error, urllib.request
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8101/internal/namespaces/healthcheck/barriers/healthcheck", timeout=2)
+          except urllib.error.HTTPError as e:
+              sys.exit(0 if e.code == 401 else 1)
+          except Exception:
+              sys.exit(1)
+          sys.exit(1)
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
 volumes:
   pgdata: {}
