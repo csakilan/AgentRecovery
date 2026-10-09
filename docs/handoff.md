@@ -104,13 +104,17 @@ The pre-existing untracked `.DS_Store` was left alone.
 | `11bf03e` | Task 9: public and internal HTTP apps, `__main__` entry point |
 | `0f843e0` | Docs: Task 9's review and the disk incident |
 | `85bb797` | Task 9 fix: route-set guard, token pairing test, JSON error envelope, localhost default |
+| `57820f7` | Docs: close Task 9 |
+| `d81ed2b` | Task 10: vendored reference, parity tests, `read_ledger` |
+| `bebb884` | Docs: suite count after Task 9 |
+| `ea68d43` | Task 10 fix: pin single snapshot, Decimal construction, autocommit guard, outcome coverage, parity via the read-only role |
 
 Verification on 2026-10-08, after starting Docker:
 
-- Full suite: **185 passed, 0 failed**, including
+- Full suite: **212 passed, 0 failed**, including
   `tests/test_environment.py::test_postgres_16_is_reachable`. The suite went
   green for the first time on this date, at 90 passed, then 109 after Task 6,
-  145 after Task 7, 164 after Task 8 and 185 after Task 9.
+  145 after Task 7, 164 after Task 8, 185 after Task 9 and 212 after Task 10.
 - Python lint and formatting checks pass.
 - The Oct 5 batch (`b39c4cb` + `01805eb`) received its first independent review
   on 2026-10-08: spec compliance passed, quality approved, no Critical issues and
@@ -136,23 +140,30 @@ test while Docker was down.
 | 7. Simulator charge and status logic | Complete; reviewed, three findings fixed, one folded into Task 8 (D9) |
 | 8. Concurrency guarantee and commit barriers | Complete; reviewed, two findings fixed, D9 satisfied |
 | 9. Public and internal HTTP apps | Complete; reviewed, five findings fixed, re-review accepted |
-| 10. Ledger reader and RetryLedger parity | **Not started. Next task.** See the `Decimal` caveat and the Task 8 consequences below |
-| 11. Container, compose, CI, protocol document | Not started |
+| 10. Ledger reader and RetryLedger parity | Complete; reviewed, five findings fixed, re-review accepted |
+| 11. Container, compose, CI, protocol document | **Not started. Last task in Plan 1** |
 
 Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
 
-## Current stop: Task 9 complete and reviewed
+## Current stop: Task 10 complete and reviewed
 
-Tasks 1 to 9 are done, each through both gates. **Task 10, the ledger reader and
-the RetryLedger parity tests, is next**, followed by Task 11.
+Tasks 1 to 10 are done, each through both gates. **Task 11 is the last task in
+Plan 1**: the container image, the Compose stack, CI, and `docs/protocol.md`.
 
-Suite is green: **185 passed**, verified 2026-10-08.
+Suite is green: **212 passed**, verified 2026-10-09.
 
-Task 10 carries required reading: see "Required reading for Task 10" below, plus
-the `Decimal` caveat under the Task 5 section. Both constrain how `read_ledger`
-must be written.
+Task 11 carries three things it must handle, all recorded below:
+
+1. The internal app now binds `127.0.0.1` by default, so any container or Cloud
+   Run deployment that must reach it needs `HOST=0.0.0.0` set explicitly. See
+   the Task 9 section.
+2. The locked formatter also checks Python examples inside Markdown, and a
+   whole-repo format check currently flags the two planning documents. Resolve
+   that check's scope before adding CI, without reformatting the plans.
+3. Verify a published uv container image tag and the current major versions of
+   the GitHub Actions used, rather than trusting the plan's dated values.
 
 ### Resolved the same day: a host disk incident worth recognising
 
@@ -560,6 +571,55 @@ the environment with a per-command default, `0.0.0.0` for public and
 `127.0.0.1` for internal, with a `HOST` override for Cloud Run. Separately, Task
 11 must keep `SIM_CONTROL_TOKEN` out of the agent's environment and keep the two
 tokens distinct; no simulator code can enforce either.
+
+## Task 10 review, 2026-10-09: parity proved against the real thing
+
+**The parity suite genuinely proves parity, and it can fail.** The tests drive
+the vendored original and our simulator step by step with the same action
+sequences, comparing against the original's own strings and its own `score()`
+output rather than hardcoded expectations. Perturbing one character of
+`TIMEOUT_MESSAGE` failed exactly the seven `lost_ack` cases; making the compat
+profile return 504 where it should return 500 failed exactly the seven
+`true_fail` cases. The vendored file's hash was verified before and after and is
+unchanged.
+
+**The parity cases now read through the evaluator's own read-only role**, which
+was the point of the exercise. The re-reviewer proved it decisively by revoking
+that role's SELECT on `call_log` in a scratch setup: all 14 parity cases failed
+with `InsufficientPrivilege`, while the six tests that read over the write role
+kept passing.
+
+**`read_ledger` departed from the brief in three ways, all required** by
+decisions made in Tasks 5 and 8, and all judged correct. It uses one `UNION ALL`
+statement so both halves of the read share a single snapshot, which matters
+because it can be called while a request is in flight. It builds the amount as
+`Decimal(str(...))`, which the Task 5 caveat demands and which alters no value
+`NUMERIC` can return. And it orders by `call_index`, claim order, rather than by
+`id`, which Task 8 requires.
+
+**Five findings, all closed in `ea68d43`,** each reproduced independently by the
+re-review. Three were tests that did not test what their names claimed: the
+single-snapshot property was guarded only by a comment and survived being split
+into two queries; the Decimal test passed even against a raw passthrough, because
+psycopg already returns `Decimal`; and the outcome-filter test built an episode
+containing only an `error_no_commit` row, so it survived the very filter it was
+named after. The other two were a missing autocommit guard, now matching the
+pattern `service.py` uses, and the parity-through-the-read-only-role gap above.
+
+Two caveats the fixer raised itself and the re-review confirmed:
+
+- Asserting that a `TypeError` surfaces was the wrong shape for the Decimal
+  test, because correct code converts a float cleanly and raises nothing. The
+  reader test therefore asserts the converted `Decimal`, with a separate test
+  pinning `LedgerCharge`'s `TypeError` directly. The pair closes the finding.
+- Perturbing a message constant fails the parity cases at the rendered-text
+  assertion, before the ledger is read, so that mutation does not exercise the
+  reader path. A ledger-side mutation does, and was used.
+
+One brittleness note, recorded rather than fixed: the single-snapshot test counts
+SQL statements rather than snapshots, so it would also fail a legitimate reshape
+such as `REPEATABLE READ` with an explicit transaction, or a named server-side
+cursor. That is a false-positive risk, not a coverage gap.
 
 ### Required reading for Task 10
 
