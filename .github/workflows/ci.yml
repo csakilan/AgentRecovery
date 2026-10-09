@@ -4,11 +4,12 @@ name: ci
 permissions:
   contents: read
 
-# Push runs only on the default branch; every other branch is covered by its pull request,
-# so a branch with an open PR does not run twice.
+# Push runs on every branch. An earlier version limited it to main to avoid a branch with an
+# open pull request running twice, but this project does its work on feature branches and does
+# not push to main, so CI never ran at all. A duplicate run on a PR branch is the cheaper
+# problem than no run on the branch where the work happens.
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
