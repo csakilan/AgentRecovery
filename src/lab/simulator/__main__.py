@@ -1,8 +1,11 @@
 """Run the simulator.
 
 python -m lab.simulator migrate    create roles and database, apply migrations
-python -m lab.simulator public     serve the public API (default port 8100)
-python -m lab.simulator internal   serve the control API (default port 8101)
+python -m lab.simulator public     serve the public API (default 0.0.0.0:8100)
+python -m lab.simulator internal   serve the control API (default 127.0.0.1:8101)
+
+HOST and PORT override the bind address. The control API defaults to loopback so that a
+missing network protection fails closed; set HOST=0.0.0.0 where the platform needs it.
 """
 
 from __future__ import annotations
@@ -47,13 +50,14 @@ def main(argv: list[str]) -> None:
     url = os.environ["LAB_PAYMENTS_URL"]
     if command == "public":
         app = create_public_app(_pool(url), os.environ["SIM_CLIENT_TOKEN"])
-        default_port = "8100"
+        default_host, default_port = "0.0.0.0", "8100"
     elif command == "internal":
         app = create_internal_app(_pool(url), os.environ["SIM_CONTROL_TOKEN"])
-        default_port = "8101"
+        default_host, default_port = "127.0.0.1", "8101"
     else:
         raise SystemExit(f"unknown command: {command}")
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", default_port)))
+    host = os.environ.get("HOST", default_host)
+    uvicorn.run(app, host=host, port=int(os.environ.get("PORT", default_port)))
 
 
 if __name__ == "__main__":

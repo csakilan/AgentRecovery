@@ -7,19 +7,22 @@ Neither app publishes an OpenAPI schema.
 
 from __future__ import annotations
 
+import logging
 import secrets
 from collections.abc import Callable
 from typing import Any
 
 import psycopg
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 from pydantic import BaseModel, ConfigDict, Field
 
 from lab.protocol.faults import FaultPlan
 from lab.protocol.task import Profile
 from lab.simulator import service
+
+logger = logging.getLogger(__name__)
 
 
 class NamespaceConfig(BaseModel):
@@ -49,8 +52,30 @@ def _unknown_namespace() -> JSONResponse:
     return JSONResponse(body, status_code=404)
 
 
+def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status_code)
+
+
+async def _pool_timeout(request: Request, exc: Exception) -> JSONResponse:
+    # Known limitation: a PoolTimeout means no database connection could be acquired, so
+    # there is no connection to write a call_log row with, and this layer deliberately
+    # does not open a second one or use a side channel. The oracle therefore undercounts
+    # an agent call that died here. That is recorded as a limitation, not worked around.
+    logger.error("connection pool timeout on %s %s", request.method, request.url.path, exc_info=exc)
+    return _error_response(503, "service_unavailable", "service temporarily unavailable")
+
+
+async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+    # Same call_log limitation as above whenever the failure precedes the claim.
+    logger.error("unhandled error on %s %s", request.method, request.url.path, exc_info=exc)
+    return _error_response(500, "unhandled_error", "unhandled server error")
+
+
 def _bare_app(title: str) -> FastAPI:
-    return FastAPI(title=title, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title=title, docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_exception_handler(PoolTimeout, _pool_timeout)
+    app.add_exception_handler(Exception, _unhandled)
+    return app
 
 
 def create_public_app(pool: ConnectionPool, client_token: str) -> FastAPI:
