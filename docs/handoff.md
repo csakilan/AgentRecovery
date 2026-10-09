@@ -100,6 +100,8 @@ The pre-existing untracked `.DS_Store` was left alone.
 | `6f00610` | Docs: Task 7 and D9 |
 | `51cf48a` | Task 8: concurrency proof, commit barriers, D9 call-accounting fix |
 | `a0f73ce` | Task 8 fix: pin claim atomicity and the barrier timeout |
+| `d53721e` | Docs: Task 8 and D9's resolution |
+| `11bf03e` | Task 9: public and internal HTTP apps, `__main__` entry point |
 
 Verification on 2026-10-08, after starting Docker:
 
@@ -131,7 +133,7 @@ test while Docker was down.
 | 6. Database helpers, simulator schema, fixtures | Complete; reviewed, one finding fixed, re-review accepted |
 | 7. Simulator charge and status logic | Complete; reviewed, three findings fixed, one folded into Task 8 (D9) |
 | 8. Concurrency guarantee and commit barriers | Complete; reviewed, two findings fixed, D9 satisfied |
-| 9. Public and internal HTTP apps | **Not started. Next task** |
+| 9. Public and internal HTTP apps | Implemented and reviewed; **four Important findings open**, fix round blocked |
 | 10. Ledger reader and RetryLedger parity | Not started. See the `Decimal` caveat and the Task 8 consequences below |
 | 11. Container, compose, CI, protocol document | Not started |
 
@@ -139,10 +141,36 @@ Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
 
-## Current stop: Task 8 complete and reviewed
+## Current stop: Task 9 reviewed, fix round not started
 
-Tasks 1 to 8 are done, each through both gates. Task 9, the public and internal
-HTTP apps, is next. Postgres is running. D9 is satisfied; see the Task 8 section.
+Tasks 1 to 8 are done, each through both gates. **Task 9 is implemented and
+reviewed** — spec compliance passed and quality was approved — but four Important
+findings are open and its fix round has not started. The user paused work there.
+
+Suite is green: **174 passed**, verified 2026-10-08 after the disk incident below
+was resolved.
+
+Two of the four findings are test-coverage gaps and can be closed under D8's
+precedent. Two need production changes beyond the brief and therefore need the
+user's decision first. All four are listed under "Task 9 review" below.
+
+### Resolved the same day: a host disk incident worth recognising
+
+The host disk filled to 100%, leaving 405 MB free of 460 GB, with Docker holding
+roughly 53 GB. Docker's VM remounted read-only, so Postgres failed every
+connection with `FATAL: could not open file "base/5/2601": Read-only file
+system`, and the suite reported 1 failed, 90 passed and 83 errors. Every error
+was a fixture that could not connect. No code had regressed.
+
+The user freed space, taking the disk to 74 GB free. That alone did not fix it:
+a VM already remounted read-only stays that way, and `docker ps`, `docker exec`
+and `docker compose` all hung. Docker Desktop had to be quit and relaunched,
+after which Postgres came up healthy and the suite returned to 174 passed.
+
+Two lessons for a successor. A wall of fixture errors with a handful of passes
+usually means the database is unreachable, not that the code broke; check that
+before investigating anything. And freeing disk space does not by itself recover
+a read-only Docker VM, so restart Docker Desktop after clearing space.
 
 Task 5 adds frozen ledger record types and pure scoring functions. It does not
 read Postgres yet; the read-only ledger reader belongs to Task 10. Its production
@@ -426,6 +454,76 @@ update-first split and is coupled to the `CheckViolation` exception type and to
 past it, though the 16-way concurrency test and `test_concurrency.py` catch that
 one, which is why both sets of tests are kept. A split legitimately wrapped in
 `conn.transaction()` passes, correctly, since it is genuinely atomic.
+
+## Task 9 review, 2026-10-08: the boundary holds, its guard does not
+
+Task 9 adds two FastAPI apps on two ports with two tokens. The public app is what
+the untrusted agent calls; the internal app holds the fault plan, barrier
+releases and namespace resets. An agent reaching those could cheat, so the
+separation is a correctness property.
+
+Spec compliance was proven mechanically: the brief's three fenced blocks, after
+formatting, are byte-identical to `app.py`, `__main__.py` and `test_http.py`.
+
+**The boundary genuinely holds today, verified empirically.** The public app's
+route table, enumerated from the app object, contains exactly `POST /v1/charges`
+and `GET /v1/payments/{idempotency_key}`. All four internal routes attempted
+against the public app, with the control token and then the client token, gave
+eight 404s. The control token on public routes gives 401, and the client token or
+no token on internal routes gives 401; these are genuine auth rejections, not
+missing-route 404s, since the same paths return 200 with the right token. Auth
+runs before validation. `/openapi.json`, `/docs`, `/redoc` and
+`/docs/oauth2-redirect` are all 404 on BOTH apps, with and without a valid token.
+Tokens are compared with `secrets.compare_digest` on bytes; across 18 header
+variants, including one byte short, one byte longer, a changed last byte, a tab
+separator and a 5000-byte value, every malformed form returns 401 and none
+raises.
+
+**Four Important findings, none Critical, fix round not started.**
+
+Two are test-coverage gaps, closable under D8's precedent:
+
+1. `tests/simulator/test_http.py:74-77`, the test asserting the public app has no
+   control routes, is effectively vacuous. It probes one path and method and
+   accepts a 405. The reviewer added the barrier-release route to a copy of the
+   public app and the test stayed green while the leaked route answered 200. This
+   is the single test guarding the task's entire purpose. The fix is to enumerate
+   the public app's routes and assert the set equals exactly the two payment
+   routes, so any added route fails whatever its path, and to derive the internal
+   route list from the internal app's own table so future control routes are
+   covered automatically.
+2. `tests/simulator/test_http.py:101-104`, the barrier-release 404 test, asserts
+   only the status code, which a missing route would also produce. Its sibling at
+   line 85 asserts the error body; this one should too.
+
+Two need production changes beyond the brief, so they need a decision:
+
+3. `src/lab/simulator/app.py:62,70`: an unhandled exception, reachably a
+   `PoolTimeout`, returns a plain-text 500 instead of the JSON error envelope AND
+   leaves no `call_log` row, so the oracle undercounts the agent's calls.
+   Reproduced at `max_size=1`. The related pool risk: `hold` polls for up to 30 s
+   while holding its pooled connection, and with `max_size=20` the 21st held
+   request blocks and then 500s. The reviewer judges this close to theoretical
+   for Task 11 unless a load test combines wide fan-out with `hold_after_commit`
+   on every index, and suggests plumbing `barrier_timeout_s` through and mapping
+   `PoolTimeout` to a logged 503.
+4. `src/lab/simulator/__main__.py:49,52` is the only place a token is paired with
+   an app, and it is untested; swapping the two would hand the agent's token to
+   the control plane and every test would still pass. The reviewer says this is
+   testable in about three lines by substituting `uvicorn.run`, which may need a
+   small change to `main()`.
+
+**On the `0.0.0.0` bind, the reviewer's judgement, recorded for the deployment
+tasks.** Acceptable but insufficient alone, and the default should change in
+code. Cloud Run requires binding `0.0.0.0:$PORT` and `__main__` already reads
+`PORT`, so the bind is not a mistake, and the control plane is token-protected
+even when reachable. But both current protections are opt-in and silent when
+omitted: forgetting Compose's `127.0.0.1:8101:8101` prefix yields a working
+system with an exposed control plane. The suggested fix is to read the host from
+the environment with a per-command default, `0.0.0.0` for public and
+`127.0.0.1` for internal, with a `HOST` override for Cloud Run. Separately, Task
+11 must keep `SIM_CONTROL_TOKEN` out of the agent's environment and keep the two
+tokens distinct; no simulator code can enforce either.
 
 ### Required reading for Task 10
 
