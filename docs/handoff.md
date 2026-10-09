@@ -102,6 +102,8 @@ The pre-existing untracked `.DS_Store` was left alone.
 | `a0f73ce` | Task 8 fix: pin claim atomicity and the barrier timeout |
 | `d53721e` | Docs: Task 8 and D9's resolution |
 | `11bf03e` | Task 9: public and internal HTTP apps, `__main__` entry point |
+| `0f843e0` | Docs: Task 9's review and the disk incident |
+| `85bb797` | Task 9 fix: route-set guard, token pairing test, JSON error envelope, localhost default |
 
 Verification on 2026-10-08, after starting Docker:
 
@@ -133,26 +135,24 @@ test while Docker was down.
 | 6. Database helpers, simulator schema, fixtures | Complete; reviewed, one finding fixed, re-review accepted |
 | 7. Simulator charge and status logic | Complete; reviewed, three findings fixed, one folded into Task 8 (D9) |
 | 8. Concurrency guarantee and commit barriers | Complete; reviewed, two findings fixed, D9 satisfied |
-| 9. Public and internal HTTP apps | Implemented and reviewed; **four Important findings open**, fix round blocked |
-| 10. Ledger reader and RetryLedger parity | Not started. See the `Decimal` caveat and the Task 8 consequences below |
+| 9. Public and internal HTTP apps | Complete; reviewed, five findings fixed, re-review accepted |
+| 10. Ledger reader and RetryLedger parity | **Not started. Next task.** See the `Decimal` caveat and the Task 8 consequences below |
 | 11. Container, compose, CI, protocol document | Not started |
 
 Plans 2 through 8 of the roadmap have not been written in detail yet. Write each
 one only after the previous plan lands, and verify the relevant library APIs on
 the day rather than trusting a dated snapshot.
 
-## Current stop: Task 9 reviewed, fix round not started
+## Current stop: Task 9 complete and reviewed
 
-Tasks 1 to 8 are done, each through both gates. **Task 9 is implemented and
-reviewed** — spec compliance passed and quality was approved — but four Important
-findings are open and its fix round has not started. The user paused work there.
+Tasks 1 to 9 are done, each through both gates. **Task 10, the ledger reader and
+the RetryLedger parity tests, is next**, followed by Task 11.
 
-Suite is green: **174 passed**, verified 2026-10-08 after the disk incident below
-was resolved.
+Suite is green: **185 passed**, verified 2026-10-08.
 
-Two of the four findings are test-coverage gaps and can be closed under D8's
-precedent. Two need production changes beyond the brief and therefore need the
-user's decision first. All four are listed under "Task 9 review" below.
+Task 10 carries required reading: see "Required reading for Task 10" below, plus
+the `Decimal` caveat under the Task 5 section. Both constrain how `read_ledger`
+must be written.
 
 ### Resolved the same day: a host disk incident worth recognising
 
@@ -479,7 +479,43 @@ variants, including one byte short, one byte longer, a changed last byte, a tab
 separator and a 5000-byte value, every malformed form returns 401 and none
 raises.
 
-**Four Important findings, none Critical, fix round not started.**
+**All findings closed in `85bb797`,** with a scoped re-review that reproduced
+each one independently in scratch copies. The detail below is kept because it
+records what was wrong and how it was proved fixed.
+
+The route-set test now compares both path and method, so a new method on an
+existing path is caught, and it derives the internal route list from the internal
+app's own table: a route added to the internal app alone is automatically covered
+by the behavioural test, which the re-reviewer verified. Three different leaks
+were each confirmed to fail it. Swapping the two tokens fails two tests. A forced
+`PoolTimeout` now returns a 503 JSON envelope on all six handlers across both
+apps, logged once, while `PoolClosed` and `TooManyRequests` still give 500, so
+the catch is narrow; a `RuntimeError` gives a 500 with the same envelope shape
+and keeps the exception text out of the body. The internal app defaults to
+`127.0.0.1` with a `HOST` override, and `PORT` handling is unchanged.
+
+Two things recorded as accepted rather than fixed:
+
+- **A real limitation.** A `PoolTimeout` happens while acquiring a connection, so
+  no connection exists and no `call_log` row can be written; the oracle
+  undercounts those agent calls. A comment at `src/lab/simulator/app.py:60-63`
+  explains why. The only mitigations without a second connection are to size the
+  pool above peak concurrency, or to keep an in-process counter on the internal
+  app and reconcile it against the oracle. Not done.
+- **Double logging on the bug path.** An `Exception` handler runs inside
+  Starlette's `ServerErrorMiddleware`, which responds and then re-raises, so
+  uvicorn logs such an error twice. Accepted: the two lines differ, it only fires
+  on a bug path, and suppressing it would mean fighting the framework. The
+  re-reviewer confirmed the registration does not interfere with FastAPI's
+  `HTTPException` or validation handling, nor with `TestClient`'s re-raise.
+
+**Consequence for Task 11.** The internal app now binds `127.0.0.1` by default,
+so any container or Cloud Run deployment that must reach it has to set
+`HOST=0.0.0.0` explicitly. That is the safe direction, since exposure is now
+opt-in, but Task 11 must do it deliberately. `HOST` is also a generic name a
+platform might export for another purpose, which is worth checking there.
+
+### What was originally found, for the record
 
 Two are test-coverage gaps, closable under D8's precedent:
 
