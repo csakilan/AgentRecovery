@@ -44,3 +44,22 @@ def svc_url(payments_db):
 def conn(svc_url):
     with psycopg.connect(svc_url, autocommit=True, row_factory=dict_row) as c:
         yield c
+
+
+RUNTIME_SVC_PASSWORD = os.environ.get("LAB_RUNTIME_SVC_PASSWORD", "dev-runtime-svc")
+
+
+@pytest.fixture(scope="session")
+def runtime_db():
+    from lab.runtime import RUNTIME_MIGRATIONS
+
+    name = f"runtime_test_{uuid.uuid4().hex[:8]}"
+    db.ensure_role(ADMIN_URL, "runtime_svc", RUNTIME_SVC_PASSWORD)
+    db.ensure_database(ADMIN_URL, name)
+    admin_url = db.with_database(ADMIN_URL, name)
+    db.apply_migrations(admin_url, RUNTIME_MIGRATIONS)
+    yield {
+        "admin": admin_url,
+        "svc": db.with_database(ADMIN_URL, name, "runtime_svc", RUNTIME_SVC_PASSWORD),
+    }
+    db.drop_database(ADMIN_URL, name)
