@@ -83,3 +83,14 @@ def role_url():
         return db.with_database(ADMIN_URL, dbname, role, ROLE_PASSWORDS[role])
 
     return build
+
+
+@pytest.fixture(scope="session")
+def admin_url():
+    """The superuser connection URL (to the maintenance database)."""
+    return ADMIN_URL
+
+
+@pytest.fixture(scope="session")
+def runtime_svc_password():
+    return RUNTIME_SVC_PASSWORD
