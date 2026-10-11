@@ -68,6 +68,16 @@ def test_a_partial_claim_is_all_or_nothing(runtime_conn):
     assert budget.used_today() == 4
 
 
+def test_requires_autocommit(runtime_db):
+    """The atomicity argument assumes each claim commits on its own. On a transactional
+    connection a claim could be rolled back after the model request had already been sent,
+    under-counting real usage, so the budget refuses such a connection outright."""
+    with psycopg.connect(runtime_db["svc"]) as c:
+        with pytest.raises(ValueError, match="autocommit"):
+            RequestBudget(c)
+        assert c.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+
 def _rows(conn):
     return conn.execute("SELECT day, requests_made, updated_at FROM request_budget").fetchall()
 
