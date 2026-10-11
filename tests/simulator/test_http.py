@@ -167,6 +167,52 @@ def test_unstorable_idempotency_key_over_http_is_a_logged_400(apps, svc_url, whi
     assert ok.status_code == 200
 
 
+# A regex ending in `$` also matches before a trailing newline. A JSON string carries one as the
+# two characters `\\n`, so an agent's tool call can deliver "USD\\n" as the currency over HTTP.
+@pytest.mark.parametrize(
+    "currency_literal",
+    ['"USD\\n"', '"\\nUSD"', '"US\\nD"', '"USD\\r\\n"', '"usd"'],
+    ids=["trailing-newline", "leading-newline", "embedded-newline", "trailing-crlf", "lowercase"],
+)
+def test_malformed_currency_over_http_is_a_logged_400_and_commits_nothing(
+    apps, svc_url, currency_literal
+):
+    public, internal = apps
+    configure(internal, "ns", {"charge": {"1": "commit_then_error"}})
+    headers = {**CLIENT, "X-Lab-Namespace": "ns", "Content-Type": "application/json"}
+    body = (
+        '{"amount": 49.99, "idempotency_key": "k1", "order_id": "1234", '
+        f'"currency": {currency_literal}}}'
+    )
+    r = public.post("/v1/charges", headers=headers, content=body)
+    assert r.status_code == 400
+    assert r.json() == {
+        "error": {
+            "code": "invalid_request",
+            "message": "currency must be a three-letter uppercase code",
+        }
+    }
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        effects, calls = read_ledger(conn, "ns")
+    assert effects == []
+    assert (calls.invalid_charge_calls, calls.charge_keys) == (1, ())
+    # Nothing was committed under the key, and the rejected call did not use up the fault.
+    assert public.get("/v1/payments/k1", headers=headers).json()["status"] == "NOT_FOUND"
+    retry = public.post(
+        "/v1/charges", headers=headers, content=body.replace(currency_literal, '"USD"')
+    )
+    assert retry.status_code == 504
+
+
+def test_exact_currency_over_http_is_stored_exactly(apps, svc_url):
+    public, internal = apps
+    configure(internal, "ns")
+    headers = {**CLIENT, "X-Lab-Namespace": "ns"}
+    r = public.post("/v1/charges", headers=headers, json=CHARGE)
+    assert r.status_code == 200
+    assert r.json()["charge"]["currency"] == "USD"
+
+
 def test_nul_in_the_status_key_over_http_is_a_logged_not_found(apps, svc_url):
     public, internal = apps
     configure(internal, "ns")

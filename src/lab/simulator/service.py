@@ -48,7 +48,8 @@ IN_FLIGHT = "in_flight"
 # Call-log outcome of a call that raised after its slot was claimed.
 SERVER_ERROR = "server_error"
 
-_CURRENCY = re.compile(r"^[A-Z]{3}$")
+# \Z, not $: in Python `$` also matches just before a trailing newline, so "USD\n" would pass.
+_CURRENCY = re.compile(r"\A[A-Z]{3}\Z")
 _COMPAT_FIELDS = frozenset({"amount", "idempotency_key"})
 _CONTROLLED_FIELDS = frozenset({"amount", "idempotency_key", "order_id", "currency"})
 

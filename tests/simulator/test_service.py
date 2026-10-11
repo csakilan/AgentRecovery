@@ -141,6 +141,50 @@ def test_controlled_validation_rejects_without_side_effects(conn, bad):
     assert counters["charge_calls"] == 0
 
 
+# `$` in a Python regex also matches just before a trailing newline, so a pattern ending in `$`
+# let "USD\n" through. The stored value then differed from the task's "USD" and the scorer
+# compared the wrong string.
+MALFORMED_CURRENCIES = [
+    pytest.param("USD\n", id="trailing-newline"),
+    pytest.param("\nUSD", id="leading-newline"),
+    pytest.param("US\nD", id="embedded-newline"),
+    pytest.param("USD\r\n", id="trailing-crlf"),
+    pytest.param("USD\n\n", id="two-trailing-newlines"),
+    pytest.param(" USD", id="leading-space"),
+    pytest.param("USD ", id="trailing-space"),
+    pytest.param("usd", id="lowercase"),
+    pytest.param("Usd", id="mixed-case"),
+    pytest.param("\uff35\uff33\uff24", id="fullwidth-letters"),
+    pytest.param("USDX", id="four-letters"),
+    pytest.param("", id="empty"),
+]
+
+
+@pytest.mark.parametrize("bad", MALFORMED_CURRENCIES)
+def test_malformed_currency_is_a_logged_400_that_claims_no_slot(conn, bad):
+    ns = make_ns(conn, World.LOST_ACK)
+    r = service.charge(conn, ns, {**CHARGE, "currency": bad})
+    assert r.http_status == 400
+    assert r.body == {
+        "error": {
+            "code": "invalid_request",
+            "message": "currency must be a three-letter uppercase code",
+        }
+    }
+    assert charges(conn, ns) == []
+    row = _only_log_row(conn, ns)
+    assert (row["call_index"], row["outcome"]) == (None, "invalid")
+    # It consumed nothing: the next call is still call 1, which the lost_ack plan faults.
+    assert service.charge(conn, ns, dict(CHARGE)).http_status == 504
+
+
+def test_a_valid_currency_is_stored_exactly_as_sent(conn):
+    ns = make_ns(conn)
+    r = service.charge(conn, ns, {**CHARGE, "currency": "EUR"})
+    assert (r.http_status, r.body["charge"]["currency"]) == (200, "EUR")
+    assert [row["currency"] for row in charges(conn, ns)] == ["EUR"]
+
+
 def test_compat_rejects_controlled_only_fields(conn):
     ns = make_ns(conn, profile=Profile.COMPAT)
     assert service.charge(conn, ns, dict(CHARGE)).http_status == 400
