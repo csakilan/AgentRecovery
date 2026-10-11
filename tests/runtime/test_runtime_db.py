@@ -150,3 +150,122 @@ def test_durability_is_recorded_on_the_experiment(runtime_db):
             "SELECT config_json->>'durability' FROM experiments WHERE id = 'e1'"
         ).fetchone()
         assert row[0] == "sync"
+
+
+MODES = ["agent_directed", "deterministic_retry", "durable_gateway"]
+
+
+def _experiment(conn, experiment_id="e1"):
+    conn.execute(
+        "INSERT INTO experiments (id, name, manifest_sha256, config_json)"
+        " VALUES (%s, 'test', 'abc', '{}')",
+        (experiment_id,),
+    )
+
+
+def _run(conn, run_id="r1", experiment_id="e1", episode_id="ep", mode="agent_directed"):
+    conn.execute(
+        "INSERT INTO runs (id, experiment_id, episode_id, namespace, mode, thread_id, state)"
+        " VALUES (%s, %s, %s, 'ns', %s, 't1', 'queued')",
+        (run_id, experiment_id, episode_id, mode),
+    )
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_every_defined_run_mode_is_accepted(runtime_db, mode):
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        _experiment(conn)
+        _run(conn, mode=mode)
+
+
+@pytest.mark.parametrize("mode", ["bogus", "Agent_Directed", ""])
+def test_run_mode_is_constrained(runtime_db, mode):
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        _experiment(conn)
+        with pytest.raises(psycopg.errors.CheckViolation):
+            _run(conn, mode=mode)
+
+
+def test_an_episode_runs_once_per_experiment(runtime_db):
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        _experiment(conn, "e1")
+        _experiment(conn, "e2")
+        _run(conn, "r1", "e1", "ep")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            _run(conn, "r2", "e1", "ep")
+        # The same episode under another experiment is a different run.
+        _run(conn, "r3", "e2", "ep")
+
+
+def test_a_run_has_one_model_call_per_turn(runtime_db):
+    insert = (
+        "INSERT INTO model_calls (run_id, turn, provider_model_id, request_json)"
+        " VALUES ('r1', %s, 'm', '{}')"
+    )
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        _experiment(conn)
+        _run(conn)
+        conn.execute(insert, (1,))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, (1,))
+        conn.execute(insert, (2,))
+
+
+def test_a_run_reaches_each_crash_point_once(runtime_db):
+    insert = "INSERT INTO crash_points (run_id, name, worker_pid) VALUES ('r1', %s, 1)"
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        _experiment(conn)
+        _run(conn)
+        conn.execute(insert, ("after_charge",))
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            conn.execute(insert, ("after_charge",))
+        conn.execute(insert, ("before_charge",))
+
+
+def test_the_runtime_role_can_use_the_sequences_it_was_granted(runtime_db):
+    """`experiments` has no sequence, so the write test above cannot notice a missing
+    sequence grant. `model_calls` and `tool_events` take their ids from one."""
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        _experiment(conn)
+        _run(conn)
+        call_ids = [
+            conn.execute(
+                "INSERT INTO model_calls (run_id, turn, provider_model_id, request_json)"
+                " VALUES ('r1', %s, 'm', '{}') RETURNING id",
+                (turn,),
+            ).fetchone()[0]
+            for turn in (1, 2)
+        ]
+        event_id = conn.execute(
+            "INSERT INTO tool_events (run_id, turn, tool, requested_args_json, rule, observation)"
+            " VALUES ('r1', 1, 'charge', '{}', 'none', 'ok') RETURNING id"
+        ).fetchone()[0]
+    assert call_ids[0] < call_ids[1]
+    assert event_id is not None
+
+
+def test_deleting_an_experiment_removes_everything_under_it(runtime_db):
+    children = ["runs", "model_calls", "tool_events", "crash_points", "results"]
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        _experiment(conn)
+        _run(conn)
+        conn.execute(
+            "INSERT INTO model_calls (run_id, turn, provider_model_id, request_json)"
+            " VALUES ('r1', 1, 'm', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO tool_events (run_id, turn, tool, requested_args_json, rule, observation)"
+            " VALUES ('r1', 1, 'charge', '{}', 'none', 'ok')"
+        )
+        conn.execute("INSERT INTO crash_points (run_id, name, worker_pid) VALUES ('r1', 'x', 1)")
+        conn.execute(
+            "INSERT INTO results (run_id, evaluator_version, verdict, correct_recovery, score_json)"
+            " VALUES ('r1', 'v1', 'ok', true, '{}')"
+        )
+        for table in children:
+            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 1, table
+
+        conn.execute("DELETE FROM experiments WHERE id = 'e1'")
+
+        for table in children:
+            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0, table
