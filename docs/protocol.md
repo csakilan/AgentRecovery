@@ -27,7 +27,8 @@ substitutes 49.99 when `amount` is missing. The compat profile instead rejects w
 - an `idempotency_key` that is not a string of 1 to 255 characters (so an empty key, a
   numeric key and an over-long key are all rejected);
 - an `amount` that is missing, not a number, not finite or a boolean;
-- any field other than `amount` and `idempotency_key`.
+- any field other than `amount` and `idempotency_key`;
+- an `idempotency_key` containing a NUL character or an unpaired surrogate (see below).
 
 Amounts that are negative, zero or have more than two decimal places are still accepted
 in compat, as in the original. A numeric string such as `"49.99"` is also accepted.
@@ -74,6 +75,15 @@ header on every request.
   `currency`).
 - `GET /v1/payments/{idempotency_key}` returns 200 with `status` `SUCCEEDED` and the
   charge, or 200 with `status` `NOT_FOUND` and `charge: null`.
+
+A JSON string can hold characters that Postgres cannot store: NUL, and an unpaired
+surrogate such as `"\ud800"` (which Python's `json.loads` accepts). A charge whose
+`idempotency_key`, or in controlled its `order_id`, contains either is rejected with 400
+`invalid_request` and logged as `invalid`, with the character shown as a visible escape in the
+log. A status lookup for such a key answers `NOT_FOUND`, since no charge can have been
+committed under it, and is logged and counted as any status call. Every other control
+character (tab, newline, DEL, the Unicode line separators) is accepted in a key or an order,
+because it is stored without trouble.
 
 Control API, port 8101, `Authorization: Bearer <control token>`. It binds `127.0.0.1` by
 default so that exposure is opt-in. In the Compose stack the container sets `HOST=0.0.0.0`

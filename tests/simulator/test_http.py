@@ -132,6 +132,52 @@ def test_non_finite_amount_over_http_is_400_and_leaves_a_call_log_row(apps, svc_
     assert (calls.invalid_charge_calls, calls.charge_keys) == (1, ())
 
 
+# Postgres cannot store a NUL character or an unpaired surrogate. Both are valid inside a JSON
+# string, and json.loads accepts them, so an agent can send either over HTTP. They used to fail
+# inside the claim, before the attempt was recorded, and surface as a 500 with no call_log row.
+UNSTORABLE_KEY_BODIES = {
+    "nul": '{"amount": 49.99, "idempotency_key": "a\\u0000b"}',
+    "surrogate": '{"amount": 49.99, "idempotency_key": "a\\ud800b"}',
+}
+
+
+@pytest.mark.parametrize("which", UNSTORABLE_KEY_BODIES)
+def test_unstorable_idempotency_key_over_http_is_a_logged_400(apps, svc_url, which):
+    public, internal = apps
+    r = internal.put(
+        "/internal/namespaces/ns", headers=CONTROL, json={"profile": "compat", "fault_plan": {}}
+    )
+    assert r.status_code == 200
+    headers = {**CLIENT, "X-Lab-Namespace": "ns", "Content-Type": "application/json"}
+    r = public.post("/v1/charges", headers=headers, content=UNSTORABLE_KEY_BODIES[which])
+    assert r.status_code == 400
+    assert r.json() == {
+        "error": {
+            "code": "invalid_request",
+            "message": "idempotency_key must not contain a NUL character or an unpaired surrogate",
+        }
+    }
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        _, calls = read_ledger(conn, "ns")
+    assert (calls.invalid_charge_calls, calls.charge_keys) == (1, ())
+    # The simulator is unharmed: the next well-formed charge is call 1 and commits.
+    ok = public.post(
+        "/v1/charges", headers=headers, content='{"amount": 49.99, "idempotency_key": "k"}'
+    )
+    assert ok.status_code == 200
+
+
+def test_nul_in_the_status_key_over_http_is_a_logged_not_found(apps, svc_url):
+    public, internal = apps
+    configure(internal, "ns")
+    r = public.get("/v1/payments/a%00b", headers={**CLIENT, "X-Lab-Namespace": "ns"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "NOT_FOUND"
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        _, calls = read_ledger(conn, "ns")
+    assert calls.status_calls == 1
+
+
 def test_barrier_routes(apps):
     _, internal = apps
     configure(internal, "ns", {"hold_after_commit": [1]})

@@ -48,6 +48,32 @@ _CURRENCY = re.compile(r"^[A-Z]{3}$")
 _COMPAT_FIELDS = frozenset({"amount", "idempotency_key"})
 _CONTROLLED_FIELDS = frozenset({"amount", "idempotency_key", "order_id", "currency"})
 
+UNSTORABLE_MESSAGE = "must not contain a NUL character or an unpaired surrogate"
+
+
+def _storable(value: str) -> bool:
+    """Whether Postgres text and jsonb can hold this string.
+
+    JSON allows any code point in a string, but Postgres rejects NUL, and an unpaired
+    surrogate (which json.loads accepts from "\\ud800") cannot be encoded as UTF-8. A
+    value like that fails inside the first statement that carries it, which for a charge
+    is the claim, so the attempt would leave no call_log row. Every other control character
+    (tab, newline, DEL, the Unicode line separators) is stored without trouble and stays
+    valid.
+    """
+    if "\x00" in value:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _clean_str(value: str) -> str:
+    """The same string made safe to store as evidence: NUL and surrogates become visible text."""
+    return value.replace("\x00", "\\u0000").encode("utf-8", "backslashreplace").decode("utf-8")
+
 
 @dataclass(frozen=True)
 class SimResponse:
@@ -192,8 +218,8 @@ def _claim_call(
             namespace,
             namespace,
             endpoint,
-            key if isinstance(key, str) else None,
-            Jsonb(request),
+            _clean_str(key) if isinstance(key, str) else None,
+            Jsonb(request, dumps=_dumps_untrusted),
             IN_FLIGHT,
         ),
     )
@@ -211,7 +237,7 @@ def _finish_call(
             " WHERE id = %s",
             (
                 resp.http_status,
-                Jsonb(resp.body),
+                Jsonb(resp.body, dumps=_dumps_untrusted),
                 outcome,
                 (time.perf_counter() - started) * 1000.0,
                 log_id,
@@ -238,6 +264,8 @@ def _validate_charge(profile: Profile, payload: dict[str, Any]) -> _ValidCharge 
         return _error(
             400, "invalid_request", "idempotency_key must be a string of 1 to 255 characters"
         )
+    if not _storable(key):
+        return _error(400, "invalid_request", f"idempotency_key {UNSTORABLE_MESSAGE}")
     try:
         amount = parse_amount(payload.get("amount"))
     except ValueError as exc:
@@ -251,6 +279,8 @@ def _validate_charge(profile: Profile, payload: dict[str, Any]) -> _ValidCharge 
     order_id = payload.get("order_id")
     if not isinstance(order_id, str) or not 1 <= len(order_id) <= 64:
         return _error(400, "invalid_request", "order_id must be a string of 1 to 64 characters")
+    if not _storable(order_id):
+        return _error(400, "invalid_request", f"order_id {UNSTORABLE_MESSAGE}")
     currency = payload.get("currency")
     if not isinstance(currency, str) or not _CURRENCY.match(currency):
         return _error(400, "invalid_request", "currency must be a three-letter uppercase code")
@@ -323,15 +353,18 @@ def _charge_result(
 
 
 def _sanitize(value: Any) -> Any:
-    """Replace non-finite floats with their JSON names so the payload fits in jsonb.
+    """Make an untrusted payload fit in jsonb without losing what was sent.
 
     Python's json.loads accepts the literals NaN, Infinity and -Infinity, so an agent can
-    send them over HTTP, but they are not valid JSON and Postgres refuses to store them.
+    send them over HTTP, but they are not valid JSON and Postgres refuses to store them;
+    they are replaced with their names. Strings are made storable by _clean_str.
     """
+    if isinstance(value, str):
+        return _clean_str(value)
     if isinstance(value, float) and not math.isfinite(value):
         return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
     if isinstance(value, dict):
-        return {k: _sanitize(v) for k, v in value.items()}
+        return {_sanitize(k): _sanitize(v) for k, v in value.items()}
     if isinstance(value, list | tuple):
         return [_sanitize(v) for v in value]
     return value
@@ -360,10 +393,10 @@ def _log(
             namespace,
             endpoint,
             call_index,
-            key if isinstance(key, str) else None,
+            _clean_str(key) if isinstance(key, str) else None,
             Jsonb(request, dumps=_dumps_untrusted),
             resp.http_status,
-            Jsonb(resp.body),
+            Jsonb(resp.body, dumps=_dumps_untrusted),
             outcome,
             (time.perf_counter() - started) * 1000.0,
         ),
@@ -431,10 +464,16 @@ def status(conn: psycopg.Connection, namespace: str, key: str) -> SimResponse:
         if call_index <= plan.status_unavailable_calls:
             resp, outcome = _error(503, "unavailable", STATUS_UNAVAILABLE_MESSAGE), "unavailable"
         else:
-            row = _one(
-                conn,
-                "SELECT * FROM charges WHERE namespace = %s AND idempotency_key = %s",
-                (namespace, key),
+            # A key Postgres cannot store was never committed (charge rejects it), so it is
+            # not found, and the lookup itself would fail on it.
+            row = (
+                _one(
+                    conn,
+                    "SELECT * FROM charges WHERE namespace = %s AND idempotency_key = %s",
+                    (namespace, key),
+                )
+                if _storable(key)
+                else None
             )
             if row is None:
                 body = {"idempotency_key": key, "status": "NOT_FOUND", "charge": None}
