@@ -207,3 +207,86 @@ def test_slots_and_log_rows_agree_under_concurrent_calls(svc_url, conn):
         assert _counters(conn, ns) == {"charge_calls": 12, "status_calls": 4}
         assert not [r for r in _log(conn, ns, "charge") if r["outcome"] == service.IN_FLIGHT]
         assert not [r for r in _log(conn, ns, "status") if r["outcome"] == service.IN_FLIGHT]
+
+
+# The two outcomes a later stage reads as "this attempt crashed": a claimed slot whose result
+# was never recorded, and a call that raised after claiming. No ordinary request may leave
+# either behind, or a healthy run would look like a crash.
+CRASH_SIGNALS = (service.IN_FLIGHT, service.SERVER_ERROR)
+
+
+def _crash_signal_rows(conn, ns):
+    return conn.execute(
+        "SELECT endpoint, call_index, outcome, http_status FROM call_log"
+        " WHERE namespace = %s AND (outcome = ANY(%s) OR http_status = 0) ORDER BY id",
+        (ns, list(CRASH_SIGNALS)),
+    ).fetchall()
+
+
+def _outcomes(conn, ns):
+    return [
+        (r["endpoint"], r["outcome"])
+        for r in conn.execute(
+            "SELECT endpoint, outcome FROM call_log WHERE namespace = %s ORDER BY id", (ns,)
+        ).fetchall()
+    ]
+
+
+def test_controlled_batch_of_ordinary_calls_leaves_no_crash_signal(conn):
+    plan = FaultPlan(
+        charge={3: "error_no_commit", 4: "commit_then_error"}, status_unavailable_calls=1
+    )
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, plan)
+    service.charge(conn, "ns", dict(CHARGE))  # committed
+    service.charge(conn, "ns", dict(CHARGE))  # replayed
+    service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k2"})  # ambiguous, no commit
+    service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k3"})  # ambiguous, committed
+    service.charge(conn, "ns", {**CHARGE, "order_id": "other"})  # conflict
+    service.charge(conn, "ns", {"idempotency_key": "k1"})  # invalid
+    service.status(conn, "ns", "k1")  # scheduled unavailable
+    service.status(conn, "ns", "k1")  # found
+    service.status(conn, "ns", "nope")  # not found
+    assert _crash_signal_rows(conn, "ns") == []
+    # The batch really exercised every path, so the empty result above cannot be vacuous.
+    assert _outcomes(conn, "ns") == [
+        ("charge", "committed"),
+        ("charge", "replayed"),
+        ("charge", "error_no_commit"),
+        ("charge", "committed_then_error"),
+        ("charge", "conflict"),
+        ("charge", "invalid"),
+        ("status", "unavailable"),
+        ("status", "succeeded"),
+        ("status", "not_found"),
+    ]
+
+
+def test_compat_scheduled_500_is_not_mistaken_for_a_crash(conn):
+    """A compat true_fail answers 500, but it is a scheduled fault, not a server_error."""
+    service.configure_namespace(
+        conn, "ns", Profile.COMPAT, FaultPlan(charge={1: "error_no_commit", 2: "commit_then_error"})
+    )
+    assert service.charge(conn, "ns", dict(COMPAT_CHARGE)).http_status == 500
+    service.charge(conn, "ns", dict(COMPAT_CHARGE))
+    service.charge(conn, "ns", dict(COMPAT_CHARGE))
+    service.status(conn, "ns", "k1")
+    assert _crash_signal_rows(conn, "ns") == []
+    assert _outcomes(conn, "ns") == [
+        ("charge", "error_no_commit"),
+        ("charge", "committed_then_error"),
+        ("charge", "replayed"),
+        ("status", "succeeded"),
+    ]
+
+
+def test_the_crash_signal_check_sees_a_real_crash(conn, monkeypatch):
+    """Guard the guard: the same query does report both signals when they are really there."""
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, FaultPlan())
+    monkeypatch.setattr(service, "_insert_or_get", _boom)
+    with pytest.raises(RuntimeError):
+        service.charge(conn, "ns", dict(CHARGE))
+    service._claim_call(conn, "ns", "status", "status_calls", "k1", {})  # never finished
+    assert [(r["endpoint"], r["outcome"]) for r in _crash_signal_rows(conn, "ns")] == [
+        ("charge", service.SERVER_ERROR),
+        ("status", service.IN_FLIGHT),
+    ]
