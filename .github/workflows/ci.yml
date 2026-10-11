@@ -1,6 +1,6 @@
 name: ci
 
-# Read-only token: the job only checks out code and runs tests.
+# Read-only token: the jobs only check out code, run tests and build the image.
 permissions:
   contents: read
 
@@ -41,3 +41,75 @@ jobs:
       # are preserved as written, so the check must not cover docs/.
       - run: uv run ruff format --check src tests scripts
       - run: uv run pytest
+
+  # Builds the image from the Dockerfile, brings up the Compose stack and runs the smoke test
+  # against it, so drift between the Dockerfile, compose.yaml and the code fails here and not
+  # when the image is first deployed. A separate job: the test job above stays fast.
+  #
+  # Postgres comes from compose.yaml's own `postgres` service, not from a `services:` block.
+  # The stack's containers reach it as `postgres:5432` on the Compose network, which a
+  # `services:` container is not on, and using the Compose service means the file that is
+  # deployed is the file that is tested, including its healthcheck and the migrate step.
+  # compose.yaml is used unmodified, so the control API keeps the host-side publish on
+  # 127.0.0.1:8101 and one step below fails the job if that ever changes.
+  stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SMOKE_PUBLIC_URL: http://127.0.0.1:8100
+      SMOKE_INTERNAL_URL: http://127.0.0.1:8101
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.22"
+      - name: Tool versions
+        run: |
+          docker version
+          docker compose version
+      # Build and start are separate steps on purpose. A failed build inside `up --build`
+      # hung on Compose 2.18 instead of exiting, whereas `build` on its own exits non-zero at
+      # once. sim-migrate owns the build (the other services reuse its image), and plain
+      # `build` covers whichever service has a build section.
+      - name: Build the image
+        run: docker compose build
+      # Not `up --wait`: how it treats the one-shot sim-migrate has varied between Compose
+      # versions, and this has to behave the same whichever one the runner has. `up` itself
+      # fails if sim-migrate exits non-zero (the simulator services depend on it with
+      # service_completed_successfully); the exit code is checked again here regardless, and
+      # each simulator service must then reach its own healthcheck within three minutes.
+      - name: Start the stack
+        run: |
+          docker compose up --detach
+          migrate="$(docker compose ps --all --quiet sim-migrate)"
+          test -n "${migrate}"
+          exit_code="$(docker inspect --format '{{.State.ExitCode}}' "${migrate}")"
+          echo "sim-migrate exited with ${exit_code}"
+          test "${exit_code}" = "0"
+          deadline=$((SECONDS + 180))
+          for service in sim-public sim-internal; do
+            until [ "$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps --quiet "${service}")" 2>/dev/null)" = "healthy" ]; do
+              if [ "${SECONDS}" -ge "${deadline}" ]; then
+                echo "${service} did not become healthy in time"
+                docker compose ps --all
+                exit 1
+              fi
+              sleep 2
+            done
+            echo "${service} is healthy"
+          done
+      - name: The control API is published on loopback only
+        run: |
+          published="$(docker compose port sim-internal 8101)"
+          echo "sim-internal 8101 is published at: ${published}"
+          test "${published}" = "127.0.0.1:8101"
+      - run: uv sync --frozen
+      # Exits non-zero on any failed check or request error.
+      - name: Smoke test
+        run: uv run python scripts/smoke_simulator.py
+      - name: Compose logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes
