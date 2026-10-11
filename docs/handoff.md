@@ -884,3 +884,62 @@ in `.superpowers/sdd/2026-10-04-plan-1-oracle-and-simulator/pre-plan-2-report.md
   Running `sim-migrate` applies it; a database holding any other outcome value refuses it.
 
 Still not done: the running stack has not been rebuilt, so none of this is deployed.
+
+## State as of 2026-10-11, end of Plan 1 and its follow-up waves
+
+`main` is at `bec3e6a`. **312 tests pass**, CI green on every merge, and the
+local stack is deployed and healthy on the current image with all three
+migrations applied.
+
+Everything the final review raised has been closed, in four waves after the
+Plan 1 merge:
+
+| Wave | What it closed |
+|---|---|
+| `cfbe775` | The unscoped parity claim, the invalid-call blind spot, the non-finite-amount 500, the dead-connection loss, the non-total ordering, and the write role's ability to rewrite the evidence |
+| `e544a89` | The client-disconnect invariant, CI building the image and running the smoke test, the crash-signal assertion, the NUL-in-key loss, a literal `args_hash`, and a CHECK on `call_log.outcome` |
+| `bec3e6a` | The currency regex accepting a trailing newline |
+
+Three of those were real bugs that would each have corrupted the attempt count,
+and all three shared one shape: a request failed in a way that returned a 500
+and lost the attempt before it was recorded. A non-finite amount, a dead pooled
+connection, and a NUL in the idempotency key. Worth remembering as a class,
+because the next one will look the same.
+
+The currency fix is worth stating plainly: before it, a real HTTP request
+carrying `"USD\n"` was accepted and committed a charge, where the contract
+promises a 400. Python's `$` matches before a trailing newline.
+
+### Verified live, not just in tests
+
+- Migration `0003` applied to the running database; all three present.
+- `NaN` and `Infinity` amounts return 400 with the JSON envelope over HTTP.
+- `"USD\n"` returns 400 over HTTP.
+- The write role is denied UPDATE and DELETE on `charges` and DELETE on
+  `call_log`, confirmed on a fresh database.
+- Both app services healthy on the rebuilt image; smoke test passes every check.
+
+### An operational trap worth knowing
+
+`docker compose build sim-public` **exits 0 and does nothing**, because
+`sim-migrate` owns the build and the other two services only reference the
+image. The build command is `docker compose build sim-migrate`. This cost a
+round of confusion when a rebuild appeared to succeed and the 40-hour-old image
+was still running. CI now builds the image, so the trap is at least caught
+there.
+
+### One decision still open
+
+A compat-profile amount of `1e999999` passes validation and then overflows in
+Postgres, producing a 500 that consumes a fault-schedule slot. This is the same
+failure class as the three bugs above, but the fix touches the compat parity
+claim, so it is the user's call. See the question recorded with it.
+
+### Deliberately not changed, because the contract is silent
+
+The amount parser is lenient in ways the contract does not define: `" 49.99 "`,
+`"4_9.99"` and Arabic-Indic digits are accepted. Whitespace is accepted in
+`order_id` and `idempotency_key`, where the contract documents length only. And
+"uppercase letters" is ASCII-only in the code while the contract does not say
+so. None is a hole against the stated contract; each is a place the contract
+could be tightened if the behaviour study turns out to care.
