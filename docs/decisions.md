@@ -2,9 +2,10 @@
 
 Agent Recovery Lab. One entry per decision that constrains the design.
 
-**Project status: planning only.** No application code, no deployed
-infrastructure, no paid model runs, no published artifacts. Nothing in this
-file records a measured result.
+**Project status, 2026-10-05:** protocol code and pure oracle scoring are
+implemented through Task 5. The user authorized committing and pushing the
+Task 4 coverage fixes and Task 5 changes. No deployed infrastructure, model runs,
+or published artifacts. Nothing in this file records an experimental result.
 
 ---
 
@@ -20,9 +21,9 @@ stays inside the approximately $300 of GCP credits.
 
 Consequences:
 
-- Evaluation is planned against a daily request ceiling. The two frozen
-  matrices total 168 episodes, at most 1008 model requests at a six-turn cap,
-  so the frozen run is a multi-day batch and must be scheduled as the final
+- Evaluation is planned against a daily request ceiling. Under the accepted
+  D4 design, the two matrices total 192 episodes, at most 1152 model requests at
+  a six-turn cap, so the frozen run is a multi-day batch and must be scheduled as the final
   activity rather than squeezed into a build day.
 - Deterministic crash, concurrency and security regressions use scripted model
   behavior and consume no model requests, so CI stays free indefinitely.
@@ -171,3 +172,53 @@ in total.
   the project and should be readable as SQL. Three databases on one instance make
   Alembic's multi-database setup more trouble than it saves.
 - Postgres 16 in Docker for local work and tests. No local `psql` is assumed.
+
+## D8. Task 4 coverage and the Task 5 review checkpoint
+
+**Date:** 2026-10-05
+**Status:** accepted by the user
+
+The user accepted the proposed batch: address all four Task 4 coverage findings,
+implement Task 5, run the tests, and stop for their review before committing.
+This resolves the earlier decision to defer or strengthen Task 4's tests.
+
+- Pin both default seeds and the complete default manifest hashes.
+- Check prompt suffixes and unique IDs in the original two-prompt matrix.
+- Check expected-effect and recovery-eligibility flags for all four worlds.
+- Check that both experiment models reject mutation and unknown fields.
+- Keep Task 4's production behavior unchanged.
+- Implement Task 5's planned scoring contract, with regression checks for
+  mixed effect counts and propagation of recovery-denominator eligibility.
+
+The batch ends after Task 5. Tasks 6 onward are not authorized by this batch.
+The changes were initially left uncommitted at the user's review checkpoint.
+The user subsequently authorized committing and pushing the batch on
+2026-10-05. Work remains stopped after Task 5.
+
+## D9. The simulator's call-counter ordering is Task 8's problem
+
+**Date:** 2026-10-08
+**Status:** accepted by the user
+
+Task 7's review found that `charge()` increments the per-namespace call counter
+and commits it before doing the work and before writing the call log. Any
+exception between the increment and the log silently consumes a fault-schedule
+slot while leaving no record that an attempt happened. That matters because the
+attempt count feeds a published metric, the legacy score's `n_charge_attempts`
+and `reused_key_on_retry`.
+
+Fixing it requires restructuring `charge()`, whose structure the Task 7 brief
+prescribes, so it was escalated rather than changed silently.
+
+The user chose to fold it into Task 8 rather than fix it first or accept it.
+
+Reason: Task 8 adds the synchronized barrier that pauses a request in exactly
+that window, so Task 8 must decide the ordering regardless. Doing it there is
+one change instead of two, and Task 8 can write a test that demonstrates the
+problem, which is awkward before barriers exist.
+
+**Binding requirement on Task 8.** Task 8 must resolve the ordering so that a
+consumed fault-schedule slot and the call-log record cannot disagree, and must
+carry a test that injects a failure between the increment and the log. The
+barrier's placement relative to the counter increment is part of that decision.
+Task 8 is not complete while this is open.

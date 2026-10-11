@@ -1,0 +1,43 @@
+name: ci
+
+# Read-only token: the job only checks out code and runs tests.
+permissions:
+  contents: read
+
+# Push runs on every branch. An earlier version limited it to main to avoid a branch with an
+# open pull request running twice, but this project does its work on feature branches and does
+# not push to main, so CI never ran at all. A duplicate run on a PR branch is the cheaper
+# problem than no run on the branch where the work happens.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv publishes exact tags only (no floating v10), so the tag is pinned in full.
+      # v10.2.0 is the newest release that has been public for a while.
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.22"
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      # Python files only, as in docs/handoff.md. The formatter also reformats Python code
+      # blocks inside Markdown, and the planning documents under docs/superpowers/plans/
+      # are preserved as written, so the check must not cover docs/.
+      - run: uv run ruff format --check src tests scripts
+      - run: uv run pytest
