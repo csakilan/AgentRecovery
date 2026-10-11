@@ -6,14 +6,17 @@ repository.
 
 Start here, then read in this order:
 
-1. `docs/decisions.md`: D1 to D8, all accepted by the user. These constrain
-   everything. Do not reverse one without asking.
+1. `docs/decisions.md`: D1 to D10, all accepted by the user. These constrain
+   everything. Do not reverse one without asking. D10 sets how the evaluation is
+   framed and is the one most likely to be overlooked.
 2. `docs/superpowers/plans/2026-10-04-roadmap.md` — the eight-stage plan, the
    architecture, the contracts, the operation state machine, the evaluation
    design, the budget and the open questions.
 3. `docs/superpowers/plans/2026-10-04-plan-1-oracle-and-simulator.md` — the
    detailed stage 1 plan, 11 tasks, each with its exact code and tests.
-4. `docs/protocol.md` — does not exist yet; Task 11 creates it.
+4. `docs/protocol.md` — the simulator's contract, written in Task 11. Its parity
+   claim is scoped to well-formed sequences; see the malformed-request limitation
+   below.
 5. `docs/pitch.md` — the sixty-second spoken explanation of the project.
 
 ## What this project is
@@ -26,8 +29,16 @@ recovery infrastructure, and what each costs.
 The one task under study: charge a synthetic customer $49.99 for order 1234,
 exactly once. The simulator hides which of two worlds it is in. In `lost_ack` the
 charge commits and the caller sees an error. In `true_fail` nothing commits and
-the caller sees the same error. A separate ledger, which no agent-side process can
-read, records what actually happened and is the only scorer.
+the caller sees the same error. A separate ledger records what actually happened
+and is the only scorer.
+
+Be precise about that last claim, because an earlier version of this document
+overstated it. The ledger is not hidden from the agent: `GET /v1/payments/{key}`
+exists precisely to reveal a payment's status, and that tool is the experimental
+variable the behaviour study manipulates. What holds is narrower and is what
+matters: no agent-side process can *write* the ledger, and the evaluator reads it
+through a role denied every write on every table. The agent can learn a payment's
+status; it cannot change the record the score is computed from.
 
 ## Hard constraints
 
@@ -204,9 +215,30 @@ The accepted matrices are 48 behavior episodes plus 144 infrastructure episodes,
 192 total and at most 1152 model requests at six turns each, excluding the pilot
 and rerun reserve. D1's older arithmetic has been reconciled with D4.
 
-The next implementation task is Task 6. The roadmap and detailed plan still
-contain their historical planning-only status labels; this file records current
-progress.
+Plan 1 is complete and merged to `main`. The roadmap and the detailed plan still
+carry their historical planning-only status labels; this file records current
+progress and supersedes them.
+
+**The malformed-request limitation, which bears on a claim.** The compat
+profile's legacy-score parity holds only for well-formed action sequences. The
+final review drove both the vendored original and our simulator with seven
+malformed input shapes across both hidden worlds and all fourteen diverged, in
+the model-visible text and in the score. The mechanism: the original counts a
+malformed call as its first charge call and so consumes the ambiguous-error slot,
+while ours rejects it with 400 and claims no slot, which puts the two out of
+phase for the rest of the episode. Outcomes flip in both directions.
+
+Neither side of that is a bug. Accepting garbage is wrong, because the `NUMERIC`
+column cannot hold it. Claiming the fault slot on an invalid call is also wrong,
+because it would make the controlled profile's fault schedule depend on how badly
+a model malformed its call. So the limitation is inherent and is handled by
+disclosure: `CallSummary` now carries `invalid_charge_calls`, the compat parity
+comparison is gated on it being zero, and `docs/protocol.md` scopes the claim.
+
+**Binding on the analysis stage:** any legacy-parity figure must exclude episodes
+with `invalid_charge_calls > 0`. Only the tests enforce that gate today, and
+decision D2 records that free-tier models are expected to emit malformed tool
+calls, so real episodes will hit it.
 
 ## The Docker blocker: resolved on 2026-10-08
 
@@ -764,3 +796,73 @@ upstream code.
   record a decision whenever one is made.
 - Do not push to `main`. Plan 1's work belongs on
   `plan-1-oracle-and-simulator` until its final review passes.
+
+## Open items after the final review, 2026-10-11
+
+The final whole-branch review ran after the merge. Verdict: sound with
+conditions, no Critical findings. The exactly-once guarantee, the barriers, the
+privilege boundary and the token split were each re-verified live rather than
+taken on trust, and a complete path was traced end to end from an HTTP charge
+through the atomic insert and the call log out to a scored verdict.
+
+Six Important findings were fixed on branch `fix/final-review-findings`
+(261 tests pass there, up from 212). Each was proved able to fail by mutation:
+
+1. The parity claim was unscoped. Fixed as described above.
+2. The evaluator could not see `invalid` rows, so it could not detect the one
+   condition that invalidates the parity comparison. `invalid_charge_calls` now
+   reads them deliberately, without loosening the `call_index IS NOT NULL`
+   predicate that makes crashed attempts count.
+3. **A real bug.** A non-finite amount returned a 500 rather than the documented
+   400 and wrote no call-log row, reachable over HTTP because `json.loads`
+   accepts `NaN` and `Infinity`. This had been filed as a cosmetic Task 7 minor.
+4. **A real bug.** The connection pool had no liveness check, so a connection
+   Postgres had already closed was handed to a request and failed *before* the
+   attempt was claimed, losing it from `n_charge_attempts`. Hit on the first
+   request to a 40-hour-old container, which makes it the likeliest trap for a
+   multi-day frozen run, and it would present as a bug in future agent code.
+   Fixed with the pool's own `check_connection`.
+5. `call_index` is a per-endpoint counter, so ordering the union by it is not a
+   total order, while the docstring promised claim order. Each subsequence is now
+   ordered explicitly and the docstring promises only what it delivers.
+6. `payment_svc` held UPDATE and DELETE on `charges` and `call_log`, so the
+   evidence was alterable by the service an agent drives. Migration `0002`
+   narrows this with column-level grants, tighter than the review proposed.
+
+### Still open
+
+- **The fix branch is not merged and the running stack is not rebuilt.** Findings
+  3, 4 and 6 are therefore not deployed. Deploying needs a `docker compose build`
+  plus recreating `sim-migrate`, `sim-public` and `sim-internal`; the migration is
+  picked up by running `sim-migrate`.
+- **A new bug, found but not fixed.** A NUL character inside an otherwise valid
+  idempotency key raises `DataError` in `_claim_call` before the slot is claimed.
+  Over HTTP that is a 500 and the attempt is lost, which is the same class of
+  loss as finding 4.
+- **`payment_svc` can still delete a namespace**, and that cascades to the
+  evidence. The control API needs it, so closing it properly requires a separate
+  control-plane role.
+- **One client token reaches every namespace.** Isolation rests entirely on the
+  `X-Lab-Namespace` header, which must never be derived from model output.
+  Decision D5's cross-namespace test covers the schema rejecting it, but nothing
+  structurally enforces the header's provenance.
+
+### Must fix before the behaviour study runs
+
+From the review's triage of the deferred minors:
+
+- The client-disconnect invariant is unpinned, and Plan 2 is the crash work.
+  `docs/protocol.md` asserts it; it holds only because both request handlers are
+  synchronous `def`, and making either `async def` would silently falsify it.
+- CI neither builds the image nor runs the smoke script, and Plan 2 deploys that
+  image, so Compose and Dockerfile drift is invisible to CI today.
+- Nothing asserts that `server_error` and `in_flight` never survive on a normal
+  path, and Plan 2's crash signal reads exactly those two outcomes.
+
+Cheap and worth doing at the same time: pin a literal `args_hash` value, and add
+the `call_log.outcome` CHECK constraint.
+
+Everything else in the deferred list genuinely carries: coverage of
+brief-verbatim code, unreached fields, cosmetics, loudly-failing preconditions
+and unreachable paths. The four `ACCEPTED` entries were reviewed and are
+correctly reasoned.

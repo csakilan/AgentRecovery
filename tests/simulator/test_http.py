@@ -1,12 +1,14 @@
 import logging
 import re
 
+import psycopg
 import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from lab.oracle.ledger import read_ledger
 from lab.simulator import app as app_module
 from lab.simulator.app import create_internal_app, create_public_app
 from tests.helpers import CHARGE
@@ -106,6 +108,28 @@ def test_unknown_namespace_is_404(apps):
     r = public.post("/v1/charges", headers={**CLIENT, "X-Lab-Namespace": "nope"}, json=CHARGE)
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "unknown_namespace"
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_amount_over_http_is_400_and_leaves_a_call_log_row(apps, svc_url, literal):
+    """The body is sent as raw text because these literals are not valid JSON, only
+    something Python's json.loads accepts, which is exactly what the server runs."""
+    public, internal = apps
+    r = internal.put(
+        "/internal/namespaces/ns", headers=CONTROL, json={"profile": "compat", "fault_plan": {}}
+    )
+    assert r.status_code == 200
+    r = public.post(
+        "/v1/charges",
+        headers={**CLIENT, "X-Lab-Namespace": "ns", "Content-Type": "application/json"},
+        content=f'{{"amount": {literal}, "idempotency_key": "k1"}}',
+    )
+    assert r.status_code == 400
+    assert r.json() == {"error": {"code": "invalid_request", "message": "amount must be finite"}}
+    # The attempt is visible to the evaluator as an invalid call, not lost.
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        _, calls = read_ledger(conn, "ns")
+    assert (calls.invalid_charge_calls, calls.charge_keys) == (1, ())
 
 
 def test_barrier_routes(apps):

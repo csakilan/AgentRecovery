@@ -12,17 +12,17 @@ Charge a synthetic customer 49.99 USD for order 1234, exactly once.
 
 **compat** reproduces RetryLedger at revision 58fdbc0d (see THIRD_PARTY_NOTICES.md):
 the same task constants, the same response strings (rendered by `lab.protocol.render`)
-and the same legacy score. The simulator serves the original's two payment operations,
-charge and payment status. The original's third tool, `report_done`, is an agent-side
-tool and is not part of the simulator.
+and the same legacy score, for well-formed request sequences. That qualifier matters: the
+two diverge as soon as a charge call is malformed, as set out below. The simulator serves
+the original's two payment operations, charge and payment status. The original's third
+tool, `report_done`, is an agent-side tool and is not part of the simulator.
 
 Its first errors differ between worlds (504 "did not confirm" in lost_ack, 500 "not
 processed" in true_fail), so a careful reader of the error text can tell the worlds apart.
 
-Known differences from the original, all at the edges. The original accepts whatever the
-agent sends: it converts a non-string key with `str()`, accepts an empty key, ignores
-unknown fields, and substitutes 49.99 when `amount` is missing. The compat profile instead
-rejects with 400:
+Known differences from the original. The original accepts whatever the agent sends: it
+converts a non-string key with `str()`, accepts an empty key, ignores unknown fields, and
+substitutes 49.99 when `amount` is missing. The compat profile instead rejects with 400:
 
 - an `idempotency_key` that is not a string of 1 to 255 characters (so an empty key, a
   numeric key and an over-long key are all rejected);
@@ -31,6 +31,26 @@ rejects with 400:
 
 Amounts that are negative, zero or have more than two decimal places are still accepted
 in compat, as in the original. A numeric string such as `"49.99"` is also accepted.
+
+These differences are not confined to the malformed call, because the two implementations
+count it differently. The original counts every charge call as an attempt before it reads
+the payload, so a malformed call consumes its first, ambiguous-error slot. Here a rejected
+call claims no fault-schedule slot (see the contract below), and it must not: if it did,
+the controlled profile's schedule would depend on how badly a model formed its call. After
+one malformed charge call the two episodes are therefore out of phase for the rest of the
+episode. The model-visible text differs from then on, `n_charge_attempts` differs, and the
+legacy score can differ in every headline cell. With the same later behaviour, in a
+true_fail world the original ends with one committed charge (correct) where compat ends
+with none (missed), and in a lost_ack world a malformed key that the original coerces to a
+different string makes it commit twice (duplicate) where compat commits once (correct).
+`tests/oracle/test_parity.py` drives seven malformed shapes through both implementations
+in both worlds and pins these differences: all fourteen diverge.
+
+The legacy-score parity claim is therefore limited to episodes in which every charge call
+is well formed. The evaluator reports `invalid_charge_calls`, the number of charge calls
+rejected by validation, so that an episode where the claim does not hold can be identified
+and reported separately or excluded, with the exclusion count stated. The parity tests
+assert it is zero before they compare scores.
 
 **controlled** is this project's modification, never described as a replication. Both
 worlds return the identical first error (HTTP 504, the "did not confirm" message). The
@@ -125,6 +145,13 @@ and `DELETE` on the namespace answers 204. Neither app publishes an OpenAPI sche
   (including a `commit_then_error` response) is built. A call scheduled for
   `error_no_commit` never reaches the ledger, so it never reaches an after-commit hold.
 - The control API, its token and the ledger reader role are never available to a model.
+- The role the simulator connects as can insert committed effects and call-log rows and
+  can fill in a call-log row's result (status, response, outcome, duration), but it cannot
+  update or delete an effect, rewrite the rest of a call-log row, or delete from either
+  table directly (migration `0002_narrow_payment_svc_grants.sql`). One path remains: it can
+  delete a namespace, and that cascades to the namespace's ledger and call log. The control
+  API needs that to reset a namespace, and it shares the role with the agent-facing
+  service, so closing it would take a separate role for the control plane.
 
 ## Verdicts
 
@@ -161,5 +188,9 @@ and a status call, including one still `in_flight`, counts toward `checked_statu
 legacy attempt count depends on them being included: without them a crashed attempt
 would vanish, and the original, which counts at the start of each charge call, would
 disagree. Calls rejected by validation are logged with outcome `invalid` and no call
-index, so they are not attempts. The oracle reads effects and call counts in a single
-statement as the `ledger_reader` role, ordered by call index, so the two always agree.
+index, so they are not attempts; the oracle reads them separately and reports their number
+as `invalid_charge_calls`, without adding them to `n_charge_attempts`. The oracle reads
+effects, call counts and invalid calls in a single statement as the `ledger_reader` role,
+so they always agree. Charge effects and charge attempts are ordered by call index, the
+order their slots were claimed. Call indexes are per endpoint, so the oracle promises no
+order between charge calls and status calls.

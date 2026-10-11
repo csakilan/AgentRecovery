@@ -3,10 +3,18 @@
 uvicorn.run is replaced by a capture so every branch runs without a server.
 """
 
+import time
+
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
+from lab.oracle.ledger import read_ledger
+from lab.protocol.faults import FaultPlan
+from lab.protocol.task import Profile
 from lab.simulator import __main__ as sim_main
+from lab.simulator import service
+from lab.simulator.app import create_public_app
 from tests.helpers import CHARGE
 
 CLIENT = {"Authorization": "Bearer client-t"}
@@ -78,3 +86,32 @@ def test_host_and_port_environment_variables_override_the_defaults(run_main, mon
     monkeypatch.setenv("PORT", "9999")
     captured = run_main(command)
     assert (captured["host"], captured["port"]) == ("192.0.2.7", 9999)
+
+
+def test_pool_never_hands_a_closed_connection_to_a_request(payments_db, svc_url, conn):
+    """A connection Postgres has closed must be replaced, not handed to the next call.
+
+    Handing it out fails the call on its first statement, before its slot is claimed, so the
+    attempt leaves no call_log row and silently disappears from n_charge_attempts.
+    """
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, FaultPlan())
+    pool = sim_main._pool(svc_url)
+    try:
+        pool.wait()
+        with pool.connection() as pooled:
+            pid = pooled.info.backend_pid
+        with psycopg.connect(payments_db["admin"], autocommit=True) as admin:
+            admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+            deadline = time.monotonic() + 5
+            while admin.execute("SELECT 1 FROM pg_stat_activity WHERE pid = %s", (pid,)).fetchone():
+                assert time.monotonic() < deadline, "backend did not exit"
+                time.sleep(0.01)  # the premise: the pooled connection is now dead
+
+        client = TestClient(create_public_app(pool, "client-t"))
+        headers = {**CLIENT, "X-Lab-Namespace": "ns"}
+        assert client.post("/v1/charges", headers=headers, json=CHARGE).status_code == 200
+    finally:
+        pool.close()
+    found, calls = read_ledger(conn, "ns")
+    assert [c.idempotency_key for c in found] == ["k1"]
+    assert calls.charge_keys == ("k1",)

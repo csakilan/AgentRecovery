@@ -291,6 +291,46 @@ def test_call_log_outcome_invalid(conn):
     assert _outcomes(conn, ns) == [("charge", "invalid")]
 
 
+NON_FINITE = [(float("nan"), "NaN"), (float("inf"), "Infinity"), (float("-inf"), "-Infinity")]
+
+
+@pytest.mark.parametrize("profile", [Profile.COMPAT, Profile.CONTROLLED])
+@pytest.mark.parametrize(("amount", "stored"), NON_FINITE)
+def test_non_finite_amount_is_rejected_with_400_and_logged_as_invalid(
+    conn, profile, amount, stored
+):
+    """NaN and Infinity reach the service over HTTP, since json.loads accepts the literals.
+
+    The rejected payload used to be stored verbatim, and Postgres refuses NaN in jsonb, so
+    the documented 400 came back as an unhandled 500 with no call_log row at all.
+    """
+    ns = make_ns(conn, profile=profile)
+    body = {**(CHARGE if profile is Profile.CONTROLLED else COMPAT_CHARGE), "amount": amount}
+    r = service.charge(conn, ns, body)
+    assert r.http_status == 400
+    assert r.body["error"] == {"code": "invalid_request", "message": "amount must be finite"}
+    assert _outcomes(conn, ns) == [("charge", "invalid")]
+    logged = conn.execute("SELECT request FROM call_log WHERE namespace = %s", (ns,)).fetchone()
+    assert logged["request"]["amount"] == stored  # the evidence is kept, as a string
+    assert charges(conn, ns) == []
+
+
+def test_non_finite_amount_claims_no_slot(conn):
+    ns = make_ns(conn, World.LOST_ACK)
+    service.charge(conn, ns, {**CHARGE, "amount": float("nan")})
+    assert service.charge(conn, ns, dict(CHARGE)).http_status == 504  # still call 1
+
+
+def test_a_payload_postgres_cannot_store_never_turns_the_400_into_a_500(conn, caplog):
+    """A NUL character is valid in a JSON string but not in jsonb, so the log write fails."""
+    ns = make_ns(conn)
+    with caplog.at_level("ERROR", logger="lab.simulator.service"):
+        r = service.charge(conn, ns, {**CHARGE, "note": "a\u0000b"})
+    assert r.http_status == 400  # the extra field is what makes it invalid
+    assert _outcomes(conn, ns) == []  # the row was lost, and said so
+    assert any(rec.exc_info for rec in caplog.records)
+
+
 def test_call_log_outcome_error_no_commit(conn):
     ns = make_ns(conn, World.TRUE_FAIL)
     service.charge(conn, ns, dict(CHARGE))
