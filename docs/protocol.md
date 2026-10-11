@@ -145,6 +145,13 @@ and `DELETE` on the namespace answers 204. Neither app publishes an OpenAPI sche
   (including a `commit_then_error` response) is built. A call scheduled for
   `error_no_commit` never reaches the ledger, so it never reaches an after-commit hold.
 - The control API, its token and the ledger reader role are never available to a model.
+- The role the simulator connects as can insert committed effects and call-log rows and
+  can fill in a call-log row's result (status, response, outcome, duration), but it cannot
+  update or delete an effect, rewrite the rest of a call-log row, or delete from either
+  table directly (migration `0002_narrow_payment_svc_grants.sql`). One path remains: it can
+  delete a namespace, and that cascades to the namespace's ledger and call log. The control
+  API needs that to reset a namespace, and it shares the role with the agent-facing
+  service, so closing it would take a separate role for the control plane.
 
 ## Verdicts
 
