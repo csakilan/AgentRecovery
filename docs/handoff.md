@@ -943,3 +943,58 @@ The amount parser is lenient in ways the contract does not define: `" 49.99 "`,
 "uppercase letters" is ASCII-only in the code while the contract does not say
 so. None is a hole against the stated contract; each is a place the contract
 could be tightened if the behaviour study turns out to care.
+
+## The lost-attempt bug class, closed 2026-10-11
+
+Four bugs found in this project shared one shape, and naming the shape is more
+useful than listing them: **a request fails in a way that returns a 500 and
+loses or corrupts the attempt before it is properly recorded.** Each would have
+undercounted or misphased attempts, which is the metric the study reports.
+
+| Bug | How it failed |
+|---|---|
+| Non-finite amount | `json.loads` accepts `NaN`, validation did not, Postgres raised, 500, no log row |
+| Dead pooled connection | No liveness check, so a closed connection failed before the slot was claimed |
+| NUL byte in the idempotency key | `DataError` inside `_claim_call`, before the claim completed |
+| Unstorable compat amount | Passed compat validation, overflowed `NUMERIC` after the slot was claimed |
+
+The last one's consequence was observed live rather than reasoned about: with
+`1e999999`, the next well-formed charge received no fault at all, 200 where the
+schedule intended 504, so the episode ran out of phase for the rest of its life.
+
+The lesson for whoever extends this: when a new failure path appears, the
+question is not only "what status does it return" but "was the attempt recorded
+before it failed". The two are independent, and the second is what corrupts
+results.
+
+The compat ceiling is 131072 digits before the decimal point and 16383 after,
+measured by inserting boundary values into a real `NUMERIC` column on the
+running server, with a test that re-inserts each edge value so that drift in the
+server's limits fails the suite. It covers underflow too, since `1e-999999` hit
+the same path. Compat stays deliberately looser than controlled: negative, zero
+and sub-cent amounts are still accepted, and the controlled profile's business
+ceiling is not reused.
+
+**381 tests pass.** `main` is at `959b44e`.
+
+### Plan 1 is closed. Starting points for Plan 2
+
+Write `docs/superpowers/plans/2026-10-04-plan-2-*.md` before implementing, in
+the same format as Plan 1, and verify the LangGraph, OpenRouter and
+OpenTelemetry APIs on the day rather than trusting the roadmap's dated snapshot.
+
+D10 governs the evaluation's framing and is the decision most likely to be
+overlooked: baseline is the model alone, treatment is the adapter, primary
+metric is duplicate charges, secondary is false success, and the number is
+written only after it is measured.
+
+Carried into Plan 2 from the reviews:
+
+- The agent's namespace isolation rests entirely on the `X-Lab-Namespace`
+  header, which must never be derived from model output. D5's cross-namespace
+  test covers the schema rejecting a model-supplied namespace, but nothing
+  structurally enforces the header's provenance in the runner that Plan 2 builds.
+- `payment_svc` can still delete a namespace, which cascades to the evidence.
+  Closing that properly needs a separate control-plane role.
+- The pool liveness fix matters most for a multi-day frozen run; that is the
+  scenario it was found in.
