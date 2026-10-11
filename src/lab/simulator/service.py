@@ -8,6 +8,9 @@ no row lock outlives the statement or transaction block that needs it.
 from __future__ import annotations
 
 import contextlib
+import json
+import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -21,6 +24,8 @@ from psycopg.types.json import Jsonb
 
 from lab.protocol.faults import ChargeFault, FaultPlan
 from lab.protocol.task import Profile, args_hash, is_minor_unit_amount, parse_amount
+
+logger = logging.getLogger(__name__)
 
 TIMEOUT_MESSAGE = "the upstream processor did not confirm. Payment status is UNKNOWN."
 NOT_PROCESSED_MESSAGE = "the charge was not processed. Payment status is UNKNOWN."
@@ -317,6 +322,25 @@ def _charge_result(
     return SimResponse(200, body), "replayed"
 
 
+def _sanitize(value: Any) -> Any:
+    """Replace non-finite floats with their JSON names so the payload fits in jsonb.
+
+    Python's json.loads accepts the literals NaN, Infinity and -Infinity, so an agent can
+    send them over HTTP, but they are not valid JSON and Postgres refuses to store them.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, dict):
+        return {k: _sanitize(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_sanitize(v) for v in value]
+    return value
+
+
+def _dumps_untrusted(value: Any) -> str:
+    return json.dumps(_sanitize(value), allow_nan=False, default=str)
+
+
 def _log(
     conn: psycopg.Connection,
     namespace: str,
@@ -337,7 +361,7 @@ def _log(
             endpoint,
             call_index,
             key if isinstance(key, str) else None,
-            Jsonb(request),
+            Jsonb(request, dumps=_dumps_untrusted),
             resp.http_status,
             Jsonb(resp.body),
             outcome,
@@ -358,17 +382,24 @@ def charge(
     profile, plan = _load(conn, namespace)
     valid = _validate_charge(profile, payload)
     if isinstance(valid, SimResponse):
-        _log(
-            conn,
-            namespace,
-            "charge",
-            None,
-            payload.get("idempotency_key"),
-            payload,
-            valid,
-            "invalid",
-            started,
-        )
+        # The payload is untrusted and this is the one path that stores it verbatim, so the
+        # log write can fail on input the validation just rejected (a NUL character in a
+        # string, say). The contract promises the 400, so a lost log row must never turn
+        # it into a 500.
+        try:
+            _log(
+                conn,
+                namespace,
+                "charge",
+                None,
+                payload.get("idempotency_key"),
+                payload,
+                valid,
+                "invalid",
+                started,
+            )
+        except (psycopg.Error, TypeError, ValueError):
+            logger.error("could not log an invalid charge request in %s", namespace, exc_info=True)
         return valid
     call_index, log_id = _claim_call(conn, namespace, "charge", "charge_calls", valid.key, payload)
     try:
