@@ -27,11 +27,27 @@ substitutes 49.99 when `amount` is missing. The compat profile instead rejects w
 - an `idempotency_key` that is not a string of 1 to 255 characters (so an empty key, a
   numeric key and an over-long key are all rejected);
 - an `amount` that is missing, not a number, not finite or a boolean;
+- an `amount` that Postgres cannot store: more than 131072 digits before the decimal point
+  or more than 16383 after it (see below);
 - any field other than `amount` and `idempotency_key`;
 - an `idempotency_key` containing a NUL character or an unpaired surrogate (see below).
 
 Amounts that are negative, zero or have more than two decimal places are still accepted
-in compat, as in the original. A numeric string such as `"49.99"` is also accepted.
+in compat, as in the original, and so is any magnitude up to the storage limit below. A
+numeric string such as `"49.99"` is also accepted.
+
+The storage limit is the only bound compat applies to an amount, and it comes from the
+database. The ledger holds amounts in an unconstrained Postgres `NUMERIC` column, which stores
+at most 131072 digits before the decimal point and 16383 after it (checked by inserting the
+boundary values on PostgreSQL 16.14; `tests/simulator/test_service.py` repeats the check
+against the server the suite runs on). Zero is exempt from the first limit but not the
+second. An amount outside it answers 400 `invalid_request` with the message "amount must have
+at most 131072 digits before the decimal point and 16383 after it", is logged as `invalid`,
+and claims no fault-schedule slot. Before this limit existed such an amount, for example
+`"1e999999"`, passed validation and then overflowed inside the insert, so the call was
+counted as an attempt and failed with a 500. A raw JSON number cannot reach the limit
+(`json.loads` turns `1e999999` into infinity, which is already rejected as not finite), so
+only a numeric string does.
 
 These differences are not confined to the malformed call, because the two implementations
 count it differently. The original counts every charge call as an attempt before it reads
@@ -47,11 +63,21 @@ different string makes it commit twice (duplicate) where compat commits once (co
 `tests/oracle/test_parity.py` drives seven malformed shapes through both implementations
 in both worlds and pins these differences: all fourteen diverge.
 
+An amount beyond the storage limit is in the same position, and for a reason no validation
+could remove. The original holds the amount as whatever Python value it was sent, in a
+dictionary, so it has no upper limit and counts such a call as an attempt that succeeds or
+fails like any other. Compat holds a `NUMERIC` column, which cannot store the value, so it
+rejects the call and claims no slot. Parity for absurd amounts was never achievable; the
+only choice was how to diverge, and rejecting before the slot is claimed keeps the fault
+schedule in phase for the rest of the episode. The call is counted in
+`invalid_charge_calls`, like any other rejected charge, and the same exclusion applies.
+
 The legacy-score parity claim is therefore limited to episodes in which every charge call
-is well formed. The evaluator reports `invalid_charge_calls`, the number of charge calls
-rejected by validation, so that an episode where the claim does not hold can be identified
-and reported separately or excluded, with the exclusion count stated. The parity tests
-assert it is zero before they compare scores.
+is well formed, and an amount within the storage limit counts as well formed. The evaluator
+reports `invalid_charge_calls`, the number of charge calls rejected by validation, so that
+an episode where the claim does not hold can be identified and reported separately or
+excluded, with the exclusion count stated. The parity tests assert it is zero before they
+compare scores.
 
 **controlled** is this project's modification, never described as a replication. Both
 worlds return the identical first error (HTTP 504, the "did not confirm" message). The

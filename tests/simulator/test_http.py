@@ -1,5 +1,6 @@
 import logging
 import re
+from decimal import Decimal
 
 import psycopg
 import pytest
@@ -335,3 +336,70 @@ def test_unhandled_exception_on_the_internal_app_is_a_500_envelope(apps, monkeyp
     r = internal.put("/internal/namespaces/ns", headers=CONTROL, json={"profile": "controlled"})
     assert r.status_code == 500
     assert _envelope(r)["code"] == "unhandled_error"
+
+
+def configure_compat(internal, ns, plan=None):
+    body = {"profile": "compat", "fault_plan": plan or {}}
+    r = internal.put(f"/internal/namespaces/{ns}", headers=CONTROL, json=body)
+    assert r.status_code == 200, r.text
+
+
+def _charge_calls(svc_url, ns):
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        return conn.execute(
+            "SELECT charge_calls FROM sim_namespaces WHERE namespace = %s", (ns,)
+        ).fetchone()[0]
+
+
+# Over HTTP a raw JSON number 1e999999 is already inf and rejected as not finite, so the only
+# way to deliver an unstorable amount is a numeric string.
+@pytest.mark.parametrize(
+    "amount_literal",
+    ['"1e999999"', '"-1e131072"', '"1e-999999"', '"1e-16384"'],
+    ids=["overflow", "negative-overflow", "underflow", "scale-limit"],
+)
+def test_unstorable_compat_amount_over_http_is_a_400_and_the_episode_stays_in_phase(
+    apps, svc_url, amount_literal
+):
+    public, internal = apps
+    configure_compat(internal, "ns", {"charge": {"1": "commit_then_error"}})
+    headers = {**CLIENT, "X-Lab-Namespace": "ns", "Content-Type": "application/json"}
+    body = f'{{"amount": {amount_literal}, "idempotency_key": "k1"}}'
+    r = public.post("/v1/charges", headers=headers, content=body)
+    assert r.status_code == 400
+    assert r.json() == {
+        "error": {
+            "code": "invalid_request",
+            "message": (
+                "amount must have at most 131072 digits before the decimal point and 16383 after it"
+            ),
+        }
+    }
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        effects, calls = read_ledger(conn, "ns")
+    assert effects == []
+    assert (calls.invalid_charge_calls, calls.charge_keys) == (1, ())
+    assert _charge_calls(svc_url, "ns") == 0
+    # Nothing was committed, and the fault scheduled for call 1 is still waiting for it.
+    assert public.get("/v1/payments/k1", headers=headers).json()["status"] == "NOT_FOUND"
+    retry = public.post(
+        "/v1/charges", headers=headers, content='{"amount": 49.99, "idempotency_key": "k1"}'
+    )
+    assert retry.status_code == 504
+    assert _charge_calls(svc_url, "ns") == 1
+    assert public.get("/v1/payments/k1", headers=headers).json()["status"] == "SUCCEEDED"
+
+
+def test_large_but_storable_compat_amount_over_http_is_stored(apps, svc_url):
+    public, internal = apps
+    configure_compat(internal, "ns")
+    headers = {**CLIENT, "X-Lab-Namespace": "ns", "Content-Type": "application/json"}
+    r = public.post(
+        "/v1/charges", headers=headers, content='{"amount": "1e131071", "idempotency_key": "k1"}'
+    )
+    assert r.status_code == 200
+    assert r.json()["charge"]["amount"] == "1" + "0" * 131071
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        effects, calls = read_ledger(conn, "ns")
+    assert [e.amount for e in effects] == [Decimal(10) ** 131071]
+    assert calls.invalid_charge_calls == 0
