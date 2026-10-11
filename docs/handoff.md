@@ -866,3 +866,21 @@ Everything else in the deferred list genuinely carries: coverage of
 brief-verbatim code, unreached fields, cosmetics, loudly-failing preconditions
 and unreachable paths. The four `ACCEPTED` entries were reviewed and are
 correctly reasoned.
+
+### Closed on `fix/pre-plan-2-hardening`
+
+The four must-fix items, the NUL bug and both cheap items above are addressed on this
+branch, each in its own commit, each with a test shown to fail under mutation. Details are
+in `.superpowers/sdd/2026-10-04-plan-1-oracle-and-simulator/pre-plan-2-report.md`.
+
+- The disconnect invariant is pinned by `tests/simulator/test_client_disconnect.py`.
+- CI has a `stack` job that builds the image, starts the Compose stack and runs the smoke
+  script. It has not run on GitHub yet; the report lists what was checked locally.
+- `tests/simulator/test_call_accounting.py` asserts no ordinary path leaves `in_flight` or
+  `server_error` behind.
+- The NUL bug is fixed, and so is its sibling, the unpaired surrogate: both are rejected in
+  validation and logged. Status lookups for such keys answer `NOT_FOUND`.
+- `args_hash` has a pinned literal, and migration `0003` constrains `call_log.outcome`.
+  Running `sim-migrate` applies it; a database holding any other outcome value refuses it.
+
+Still not done: the running stack has not been rebuilt, so none of this is deployed.
