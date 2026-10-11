@@ -1,17 +1,44 @@
 import psycopg
 import pytest
+from psycopg import sql
+
+
+@pytest.fixture(scope="session")
+def truncate_runtime_tables(runtime_db):
+    """Empty every runtime table. The list comes from the database, so a table a later
+    migration adds is cleaned without anyone remembering to edit this file.
+
+    `schema_migrations` is the one table left alone: truncating it would make
+    `apply_migrations` run 0001 again and fail with "table already exists", which would
+    break the idempotence test for the wrong reason. TRUNCATE needs the admin connection,
+    because `runtime_svc` is deliberately not granted it.
+    """
+
+    def truncate() -> None:
+        with psycopg.connect(runtime_db["admin"], autocommit=True) as conn:
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT tablename FROM pg_tables"
+                    " WHERE schemaname = 'public' AND tablename <> 'schema_migrations'"
+                    " ORDER BY tablename"
+                )
+            ]
+            if tables:
+                conn.execute(
+                    sql.SQL("TRUNCATE {} RESTART IDENTITY CASCADE").format(
+                        sql.SQL(", ").join(sql.Identifier(t) for t in tables)
+                    )
+                )
+
+    return truncate
 
 
 @pytest.fixture(autouse=True)
-def _empty_runtime_tables(runtime_db):
+def _empty_runtime_tables(truncate_runtime_tables):
     """Give every runtime test an empty database, as `svc_url` does for payments.
 
     `runtime_db` is session-scoped, so without this the rows one test inserts would
-    collide with the next. TRUNCATE needs the admin connection: `runtime_svc` is
-    deliberately not granted it. `schema_migrations` is left alone.
+    collide with the next.
     """
-    with psycopg.connect(runtime_db["admin"], autocommit=True) as conn:
-        conn.execute(
-            "TRUNCATE experiments, runs, model_calls, tool_events, crash_points,"
-            " results, request_budget RESTART IDENTITY CASCADE"
-        )
+    truncate_runtime_tables()

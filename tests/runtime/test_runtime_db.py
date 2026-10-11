@@ -269,3 +269,27 @@ def test_deleting_an_experiment_removes_everything_under_it(runtime_db):
 
         for table in children:
             assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0, table
+
+
+def test_truncation_covers_tables_added_later_and_spares_the_migration_record(
+    runtime_db, truncate_runtime_tables
+):
+    """The list of tables to empty between tests is read from the database, so a table a
+    later migration adds is emptied too. schema_migrations is the one exception."""
+    with psycopg.connect(runtime_db["admin"], autocommit=True) as conn:
+        conn.execute("CREATE TABLE added_by_a_later_migration (id INTEGER PRIMARY KEY)")
+        try:
+            conn.execute("INSERT INTO added_by_a_later_migration VALUES (1)")
+            _experiment(conn)
+            recorded = conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            assert recorded > 0
+
+            truncate_runtime_tables()
+
+            assert (
+                conn.execute("SELECT count(*) FROM added_by_a_later_migration").fetchone()[0] == 0
+            )
+            assert conn.execute("SELECT count(*) FROM experiments").fetchone()[0] == 0
+            assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == recorded
+        finally:
+            conn.execute("DROP TABLE added_by_a_later_migration")
