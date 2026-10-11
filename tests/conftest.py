@@ -21,15 +21,18 @@ def payments_db():
     db.ensure_role(ADMIN_URL, "payment_svc", PAYMENT_SVC_PASSWORD)
     db.ensure_role(ADMIN_URL, "ledger_reader", LEDGER_READER_PASSWORD)
     db.ensure_database(ADMIN_URL, name)
-    admin_url = db.with_database(ADMIN_URL, name)
-    db.apply_migrations(admin_url, SIM_MIGRATIONS)
-    yield {
-        "name": name,
-        "admin": admin_url,
-        "svc": db.with_database(ADMIN_URL, name, "payment_svc", PAYMENT_SVC_PASSWORD),
-        "reader": db.with_database(ADMIN_URL, name, "ledger_reader", LEDGER_READER_PASSWORD),
-    }
-    db.drop_database(ADMIN_URL, name)
+    try:
+        admin_url = db.with_database(ADMIN_URL, name)
+        db.apply_migrations(admin_url, SIM_MIGRATIONS)
+        yield {
+            "name": name,
+            "admin": admin_url,
+            "svc": db.with_database(ADMIN_URL, name, "payment_svc", PAYMENT_SVC_PASSWORD),
+            "reader": db.with_database(ADMIN_URL, name, "ledger_reader", LEDGER_READER_PASSWORD),
+        }
+    finally:
+        # Also when a migration fails during setup, which would otherwise leak the database.
+        db.drop_database(ADMIN_URL, name)
 
 
 @pytest.fixture
@@ -57,14 +60,17 @@ def runtime_db():
     name = f"runtime_test_{uuid.uuid4().hex[:8]}"
     db.ensure_role(ADMIN_URL, "runtime_svc", RUNTIME_SVC_PASSWORD)
     db.ensure_database(ADMIN_URL, name)
-    admin_url = db.with_database(ADMIN_URL, name)
-    db.apply_migrations(admin_url, RUNTIME_MIGRATIONS)
-    yield {
-        "name": name,
-        "admin": admin_url,
-        "svc": db.with_database(ADMIN_URL, name, "runtime_svc", RUNTIME_SVC_PASSWORD),
-    }
-    db.drop_database(ADMIN_URL, name)
+    try:
+        admin_url = db.with_database(ADMIN_URL, name)
+        db.apply_migrations(admin_url, RUNTIME_MIGRATIONS)
+        yield {
+            "name": name,
+            "admin": admin_url,
+            "svc": db.with_database(ADMIN_URL, name, "runtime_svc", RUNTIME_SVC_PASSWORD),
+        }
+    finally:
+        # Also when a migration fails during setup, which would otherwise leak the database.
+        db.drop_database(ADMIN_URL, name)
 
 
 ROLE_PASSWORDS = {
