@@ -249,7 +249,10 @@ def test_outcome_check_is_added_to_an_existing_database_and_keeps_its_rows(payme
         with psycopg.connect(admin_url, autocommit=True) as conn:
             conn.execute(_SEED_NS)
             conn.execute(_SEED_ROW, ("committed",))
-        assert db.apply_migrations(admin_url, SIM_MIGRATIONS) == ["0003_call_log_outcome_check.sql"]
+        # Later migrations may follow 0003; this test is about 0003 landing on a 0002 database.
+        assert (
+            db.apply_migrations(admin_url, SIM_MIGRATIONS)[0] == "0003_call_log_outcome_check.sql"
+        )
         with psycopg.connect(admin_url, autocommit=True) as conn:
             assert conn.execute("SELECT count(*) FROM call_log").fetchone()[0] == 1
             with pytest.raises(psycopg.errors.CheckViolation):

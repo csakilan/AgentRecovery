@@ -65,3 +65,21 @@ def runtime_db():
         "svc": db.with_database(ADMIN_URL, name, "runtime_svc", RUNTIME_SVC_PASSWORD),
     }
     db.drop_database(ADMIN_URL, name)
+
+
+ROLE_PASSWORDS = {
+    "payment_svc": PAYMENT_SVC_PASSWORD,
+    "ledger_reader": LEDGER_READER_PASSWORD,
+    "runtime_svc": RUNTIME_SVC_PASSWORD,
+}
+
+
+@pytest.fixture(scope="session")
+def role_url():
+    """Build a connection URL for any of the lab's login roles on any database. The roles
+    exist once `payments_db` and `runtime_db` have both been requested."""
+
+    def build(role: str, dbname: str) -> str:
+        return db.with_database(ADMIN_URL, dbname, role, ROLE_PASSWORDS[role])
+
+    return build
