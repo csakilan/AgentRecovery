@@ -23,7 +23,15 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from lab.protocol.faults import ChargeFault, FaultPlan
-from lab.protocol.task import Profile, args_hash, is_minor_unit_amount, parse_amount
+from lab.protocol.task import (
+    NUMERIC_MAX_INTEGER_DIGITS,
+    NUMERIC_MAX_SCALE,
+    Profile,
+    args_hash,
+    is_minor_unit_amount,
+    is_storable_amount,
+    parse_amount,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +62,10 @@ _COMPAT_FIELDS = frozenset({"amount", "idempotency_key"})
 _CONTROLLED_FIELDS = frozenset({"amount", "idempotency_key", "order_id", "currency"})
 
 UNSTORABLE_MESSAGE = "must not contain a NUL character or an unpaired surrogate"
+AMOUNT_RANGE_MESSAGE = (
+    f"amount must have at most {NUMERIC_MAX_INTEGER_DIGITS} digits before the decimal point"
+    f" and {NUMERIC_MAX_SCALE} after it"
+)
 
 
 def _storable(value: str) -> bool:
@@ -276,6 +288,11 @@ def _validate_charge(profile: Profile, payload: dict[str, Any]) -> _ValidCharge 
     except ValueError as exc:
         return _error(400, "invalid_request", str(exc))
     if profile is Profile.COMPAT:
+        # Compat skips the controlled business rules on purpose, but an amount Postgres cannot
+        # store would fail inside the insert, after the attempt was claimed and counted. This
+        # runs in validation, before _claim_call, so such a call consumes no fault-schedule slot.
+        if not is_storable_amount(amount):
+            return _error(400, "invalid_request", AMOUNT_RANGE_MESSAGE)
         return _ValidCharge(key, None, amount, None)
     if not is_minor_unit_amount(amount):
         return _error(

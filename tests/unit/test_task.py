@@ -7,6 +7,7 @@ from lab.protocol.task import (
     Profile,
     args_hash,
     is_minor_unit_amount,
+    is_storable_amount,
     parse_amount,
 )
 
@@ -90,3 +91,37 @@ def test_args_hash_changes_with_any_argument():
     assert args_hash("1234", Decimal("4999"), "USD") != base
     assert args_hash("1234", Decimal("49.99"), "EUR") != base
     assert args_hash(None, Decimal("49.99"), None) != base
+
+
+# The limits of an unconstrained Postgres NUMERIC: 131072 digits before the decimal point and
+# 16383 after it. tests/simulator/test_service.py checks the same boundaries against a live
+# server, so this table and the database cannot drift apart unnoticed.
+@pytest.mark.parametrize(
+    ("raw", "ok"),
+    [
+        ("49.99", True),
+        ("-49.99", True),
+        ("0", True),
+        ("1e131071", True),
+        ("-1e131071", True),
+        ("9" * 131072, True),
+        ("1e131072", False),
+        ("-1e131072", False),
+        ("9" * 131073, False),
+        ("1e999999", False),
+        ("1e999999999999999999", False),
+        ("1e-16383", True),
+        ("1e-16384", False),
+        ("1e-999999", False),
+        ("1." + "0" * 16383, True),
+        ("1." + "0" * 16384, False),
+        # Zero is stored at any magnitude but still has a scale.
+        ("0e999999", True),
+        ("0e-16383", True),
+        ("0e-16384", False),
+        ("9" * 131072 + "." + "9" * 16383, True),
+    ],
+    ids=lambda v: v if isinstance(v, bool) else (v if len(v) < 24 else f"{v[:6]}..len{len(v)}"),
+)
+def test_is_storable_amount_marks_the_edge_of_what_numeric_can_hold(raw, ok):
+    assert is_storable_amount(parse_amount(raw)) is ok

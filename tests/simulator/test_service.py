@@ -1,11 +1,12 @@
 import json
+from decimal import Decimal
 
 import psycopg
 import pytest
 
 from lab.protocol.faults import FaultPlan, World, world_fault_plan
 from lab.protocol.render import render_charge
-from lab.protocol.task import Profile
+from lab.protocol.task import Profile, is_storable_amount
 from lab.simulator import service
 from tests.helpers import CHARGE, COMPAT_CHARGE, charges
 
@@ -499,3 +500,112 @@ def test_delete_namespace_removes_it_and_its_ledger(conn):
         service.charge(conn, ns, dict(CHARGE))
     with pytest.raises(service.UnknownNamespace):
         service.status(conn, ns, "k1")
+
+
+# --- Compat amount ceiling ---------------------------------------------------------------
+#
+# Compat does not apply the controlled business ceiling, so an amount that Postgres cannot
+# store used to pass validation, claim a fault slot, then raise NumericValueOutOfRange inside
+# the insert and surface as a 500 after the attempt had been counted. It must be a 400
+# before the slot is claimed. A raw JSON number cannot reach this (json.loads turns 1e999999
+# into inf, which is already rejected as not finite), so the amount arrives as a string.
+AMOUNT_RANGE_MESSAGE = (
+    "amount must have at most 131072 digits before the decimal point and 16383 after it"
+)
+UNSTORABLE_AMOUNTS = [
+    pytest.param("1e999999", id="1e999999-the-reported-overflow"),
+    pytest.param("1e131072", id="one-digit-over-the-magnitude-limit"),
+    pytest.param("-1e131072", id="negative-over-the-magnitude-limit"),
+    pytest.param("9" * 131073, id="131073-digits"),
+    pytest.param("1e1000000", id="past-the-decimal-module-emax"),
+    pytest.param("1e999999999999999999", id="exponent-near-int64"),
+    pytest.param("1e-16384", id="one-place-over-the-scale-limit"),
+    pytest.param("1e-999999", id="1e-999999-underflow"),
+    pytest.param("0e-16384", id="zero-with-too-many-places"),
+    pytest.param("1." + "0" * 16384, id="16384-places"),
+]
+STORABLE_LARGE_AMOUNTS = [
+    pytest.param("1e131071", id="largest-magnitude"),
+    pytest.param("-1e131071", id="largest-negative"),
+    pytest.param("9" * 131072, id="131072-nines"),
+    pytest.param("1e-16383", id="smallest-scale"),
+    pytest.param("1." + "0" * 16383, id="16383-places"),
+    pytest.param("0e-16383", id="zero-at-the-scale-limit"),
+    pytest.param("0e999999", id="zero-with-a-huge-exponent"),
+    pytest.param("1000000.01", id="just-over-the-controlled-ceiling"),
+    pytest.param("0.001", id="sub-cent"),
+]
+
+
+def _counters(conn, ns):
+    return conn.execute(
+        "SELECT charge_calls, status_calls FROM sim_namespaces WHERE namespace = %s", (ns,)
+    ).fetchone()
+
+
+@pytest.mark.parametrize("bad", UNSTORABLE_AMOUNTS)
+def test_compat_amount_postgres_cannot_store_is_a_400_before_a_slot_is_claimed(conn, bad):
+    ns = make_ns(conn, World.LOST_ACK, Profile.COMPAT)
+    r = service.charge(conn, ns, {"amount": bad, "idempotency_key": "k1"})
+    assert r.http_status == 400
+    assert r.body == {"error": {"code": "invalid_request", "message": AMOUNT_RANGE_MESSAGE}}
+    assert charges(conn, ns) == []
+    row = _only_log_row(conn, ns)
+    assert (row["call_index"], row["outcome"]) == (None, "invalid")
+    # The slot was not consumed: the namespace counter is untouched and no call has an index.
+    assert _counters(conn, ns) == {"charge_calls": 0, "status_calls": 0}
+    claimed = conn.execute(
+        "SELECT count(*) AS n FROM call_log WHERE namespace = %s AND call_index IS NOT NULL",
+        (ns,),
+    ).fetchone()
+    assert claimed["n"] == 0
+    # The episode is still in phase: the next well-formed call is call 1, which lost_ack
+    # faults by committing and then answering with the timeout.
+    nxt = service.charge(conn, ns, dict(COMPAT_CHARGE))
+    assert nxt.http_status == 504
+    assert nxt.body["error"]["message"] == service.TIMEOUT_MESSAGE
+    assert [c["call_index"] for c in charges(conn, ns)] == [1]
+    assert _counters(conn, ns) == {"charge_calls": 1, "status_calls": 0}
+
+
+@pytest.mark.parametrize("amount", STORABLE_LARGE_AMOUNTS)
+def test_compat_still_accepts_every_amount_postgres_can_store(conn, amount):
+    ns = make_ns(conn, profile=Profile.COMPAT)
+    r = service.charge(conn, ns, {"amount": amount, "idempotency_key": "k1"})
+    assert r.http_status == 200
+    assert Decimal(r.body["charge"]["amount"]) == Decimal(amount)
+    assert [c["amount"] for c in charges(conn, ns)] == [Decimal(amount)]
+    assert _counters(conn, ns) == {"charge_calls": 1, "status_calls": 0}
+    assert service.status(conn, ns, "k1").body["status"] == "SUCCEEDED"
+
+
+# The bound is not a round number picked to look safe: it is whatever this Postgres accepts.
+# Each case is inserted into a real NUMERIC column and the predicate must agree with the
+# outcome, so a change in the server's limits (or a typo in ours) fails here.
+EDGE_AMOUNTS = [
+    *(p.values[0] for p in UNSTORABLE_AMOUNTS),
+    *(p.values[0] for p in STORABLE_LARGE_AMOUNTS),
+    "1e131070",
+    "1e131072",
+    "1." + "5" + "0" * 16382,
+    "1." + "5" + "0" * 16383,
+    "9" * 131072 + "." + "9" * 16383,
+    "9" * 131072 + "." + "9" * 16384,
+]
+
+
+@pytest.mark.parametrize(
+    "raw", EDGE_AMOUNTS, ids=lambda v: v if len(v) < 24 else f"{v[:6]}..len{len(v)}"
+)
+def test_is_storable_amount_agrees_with_a_real_numeric_column(conn, raw):
+    from lab.protocol.task import parse_amount
+
+    amount = parse_amount(raw)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS probe_amount (a NUMERIC NOT NULL)")
+    conn.execute("TRUNCATE probe_amount")
+    try:
+        conn.execute("INSERT INTO probe_amount (a) VALUES (%s)", (amount,))
+        stored = True
+    except psycopg.errors.NumericValueOutOfRange:
+        stored = False
+    assert is_storable_amount(amount) is stored
