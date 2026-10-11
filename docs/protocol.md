@@ -134,6 +134,9 @@ and `DELETE` on the namespace answers 204. Neither app publishes an OpenAPI sche
   row and is not counted as an attempt. This is a recorded limitation, not a handled case.
 - If a client disconnects mid-request, the simulator still completes the request, commits
   or not as it would have, and records the result; the client simply never receives it.
+  This holds because every request handler is a plain `def`, which Starlette runs in a
+  worker thread that a disconnect cannot cancel. `tests/simulator/test_client_disconnect.py`
+  pins both the handlers' synchronous form and the behaviour against a real server.
 - Holds pause a charge at the barrier `before_commit:<n>` or `after_commit:<n>`, where
   `<n>` is the call's index in that namespace. A hold ends when the barrier is released or
   after 30 s, whichever comes first, and the request then continues normally. A barrier
