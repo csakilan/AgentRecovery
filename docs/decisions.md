@@ -276,3 +276,65 @@ is a subtler second finding, not a lead.
 2. The Task 7 review found the test suite caught 8 of 18 injected faults in the
    simulator. After the fix waves, every injected fault is caught. That is a
    measurable statement about test effectiveness rather than about the system.
+
+## D11. Library facts verified for Plan 2, and what they change
+
+**Date:** 2026-10-11
+**Status:** accepted; supersedes the roadmap's dated snapshot
+
+Verified today rather than trusted from the roadmap, as the handoff requires.
+
+**OpenRouter free-tier limits, from the official docs:** 20 requests per minute
+at every level; 50 per day below the credit threshold and **1,000 per day at or
+above it**; the threshold is 10 credits all-time purchased, and the higher limit
+starts one credit early at 9 to absorb rounding. A third-party source claimed
+200 per day, which is wrong. **D1's arithmetic stands**, so the roughly 1,600
+planned requests remain about two days of allowance rather than eight.
+
+**Free tool-capable models exist and are discoverable, not guesswork.**
+`GET https://openrouter.ai/api/v1/models` returned 458 models, of which 15 end
+in `:free` and **14 declare `tools` in `supported_parameters`**. The pilot must
+query this live and filter on that field rather than hardcoding a list from a
+blog, because free availability changes. Today's candidates with the largest
+context windows include `thinkingmachines/inkling:free`,
+`nvidia/nemotron-3-ultra-550b-a55b:free`, `google/gemma-4-31b-it:free` and
+`poolside/laguna-s-2.1:free`. Declaring `tools` is not the same as emitting
+well-formed calls under pressure, which is what D2's conformance pilot measures.
+
+**Versions:** `langgraph` 1.2.14 (2026-10-06) and
+`langgraph-checkpoint-postgres` 3.1.2 (2026-08-07), both requiring Python 3.10
+or newer. We are on 3.12.
+
+**LangGraph has a durability setting, which the roadmap did not account for.**
+Graph execution takes `durability="exit" | "async" | "sync"`. `exit` saves only
+when execution ends, so intermediate state is lost on a mid-run crash. `async`
+saves while the next step runs, with a small risk that a checkpoint is missing
+after a crash. `sync` writes every checkpoint before the next step begins.
+
+Consequence, and it matters for fairness: **all three modes must run with the
+same durability setting, and that setting must be `sync`.** Giving the durable
+gateway `sync` while leaving the baselines on `exit` would hand mode C a win
+that came from switching off the baselines' checkpointing, which is exactly the
+rigged comparison the brief forbids. Record the setting in the experiment
+config, beside the model ID and the prompt version.
+
+**The boundary this project studies is undocumented upstream.** The LangGraph
+documentation states that when a node fails in a super-step, the writes of
+sibling nodes that succeeded are kept and those nodes do not re-run. It does
+**not** state what happens to a node that completed but whose write had not been
+committed when the process died. That is precisely the commit-then-crash
+boundary the lab exists to measure.
+
+Two consequences. Plan 2 must determine it empirically rather than cite it, with
+a test that kills a worker inside a tool node and observes which nodes re-run.
+And the finding is worth reporting in the writeup: the replay behaviour at the
+boundary where an external effect has committed but the graph has not recorded
+it is not specified by the framework, which is why a durable journal outside the
+graph is needed at all.
+
+**Observability, revised.** The GenAI semantic conventions have moved to a
+separate repository whose releases section is empty and whose schema URL reads
+"TODO", so they are in flux. Use the attribute names where convenient, but do
+not depend on them and do not claim conformance to them. Structured events in
+Postgres remain the source of record for scoring; traces are for debugging and
+the demo, as D6 already says.
