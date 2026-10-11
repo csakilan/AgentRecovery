@@ -245,6 +245,31 @@ def test_read_ledger_orders_by_claim_not_by_completion(payments_db, svc_url, con
     assert calls.charge_keys == ("k1", "k2")
 
 
+def test_read_ledger_orders_charges_by_claim_when_status_calls_interleave(
+    payments_db, svc_url, conn
+):
+    """Charge and status calls share index numbers, so only the charge subsequence is ordered.
+
+    Status 1, charge 1 (held), status 2, charge 2: the call_index values 1, 1, 2, 2 tie
+    across endpoints, and charge 2 commits before charge 1. The charges and their keys must
+    still come back in claim order.
+    """
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, FaultPlan(hold_before_commit=(1,)))
+    service.status(conn, "ns", "k1")
+    thread, result = _charge_in_background(svc_url, "ns", dict(CHARGE))
+    _wait_until(lambda: service.barrier_state(conn, "ns", "before_commit:1")["reached"])
+    service.status(conn, "ns", "k1")
+    assert service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k2"}).http_status == 200
+    service.release_barrier(conn, "ns", "before_commit:1")
+    thread.join(5)
+    assert result["response"].http_status == 200
+
+    with psycopg.connect(payments_db["reader"], autocommit=True) as reader:
+        found, calls = read_ledger(reader, "ns")
+    assert [(c.idempotency_key, c.call_index) for c in found] == [("k1", 1), ("k2", 2)]
+    assert calls == CallSummary(charge_keys=("k1", "k2"), status_calls=2, invalid_charge_calls=0)
+
+
 def test_read_ledger_requires_autocommit(payments_db):
     with psycopg.connect(payments_db["reader"]) as c:
         with pytest.raises(ValueError, match="autocommit"):

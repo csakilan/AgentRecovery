@@ -184,4 +184,6 @@ disagree. Calls rejected by validation are logged with outcome `invalid` and no 
 index, so they are not attempts; the oracle reads them separately and reports their number
 as `invalid_charge_calls`, without adding them to `n_charge_attempts`. The oracle reads
 effects, call counts and invalid calls in a single statement as the `ledger_reader` role,
-ordered by call index, so they always agree.
+so they always agree. Charge effects and charge attempts are ordered by call index, the
+order their slots were claimed. Call indexes are per endpoint, so the oracle promises no
+order between charge calls and status calls.
