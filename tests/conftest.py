@@ -24,6 +24,7 @@ def payments_db():
     admin_url = db.with_database(ADMIN_URL, name)
     db.apply_migrations(admin_url, SIM_MIGRATIONS)
     yield {
+        "name": name,
         "admin": admin_url,
         "svc": db.with_database(ADMIN_URL, name, "payment_svc", PAYMENT_SVC_PASSWORD),
         "reader": db.with_database(ADMIN_URL, name, "ledger_reader", LEDGER_READER_PASSWORD),
@@ -59,6 +60,7 @@ def runtime_db():
     admin_url = db.with_database(ADMIN_URL, name)
     db.apply_migrations(admin_url, RUNTIME_MIGRATIONS)
     yield {
+        "name": name,
         "admin": admin_url,
         "svc": db.with_database(ADMIN_URL, name, "runtime_svc", RUNTIME_SVC_PASSWORD),
     }
