@@ -222,3 +222,57 @@ consumed fault-schedule slot and the call-log record cannot disagree, and must
 carry a test that injects a failure between the increment and the log. The
 barrier's placement relative to the counter increment is part of that decision.
 Task 8 is not complete while this is open.
+
+## D10. The evaluation is framed as baseline and treatment, not a three-way survey
+
+**Date:** 2026-10-11
+**Status:** accepted by the user
+
+The user asked for a result of the shape: measure a metric, understand the
+system, change it, measure again, and report how far the metric moved. The
+earlier design produced a side-by-side comparison of three modes, which reads
+as a survey and makes a weaker claim from the same data.
+
+**Baseline:** the model on its own, which the 48-episode behaviour study already
+measures (mode A, `agent_directed`).
+
+**Treatment:** the adapters, which are the engineered change.
+
+**Primary metric: duplicate charges.** When the model cannot check payment
+status and receives an ambiguous error, some fraction of the time it retries
+under a fresh idempotency key and charges twice. A stable key cannot do this,
+because the backend's atomic idempotency record absorbs the retry. So the
+expected finding is a real rate falling to zero with a one-sentence mechanism.
+Chosen as primary because it is near-certain to hold and is intuitive to a
+non-specialist reader.
+
+**Secondary metric: false success.** The worst verdict in the taxonomy: the agent
+reports success when nothing committed, so a human downstream believes it. If
+the model alone does this at any rate and the gateway drives it to zero by
+requiring evidence before claiming success, the prevented failure is the
+expensive one.
+
+**Explicitly not the headline:** deterministic retry versus durable gateway. Both
+use a stable key, so on effect correctness they will probably tie. The gateway's
+real advantage is truthful reporting when status evidence is unavailable, which
+is a subtler second finding, not a lead.
+
+**Binding constraints on this framing.**
+
+- The metric and the comparison are pre-registered before the frozen run. The
+  number is written only after it is measured. Choosing a target figure and then
+  finding data to match it is the one failure mode this project exists to avoid,
+  and it would not survive an interviewer's probing.
+- A tie, or a baseline that turns out already strong, is published as measured.
+- The denominator is stated with every rate, and the Wilson interval with it.
+  Twenty-four repetitions per cell is exploratory, and the report says so.
+
+**Two before-and-after results already measured, usable now.**
+
+1. The D9 call-accounting fix took the legacy attempt count on a crash episode
+   from 1 to 3, and key reuse from 0 to 1, bringing both into exact agreement
+   with the reference implementation. Before the fix the count was silently
+   wrong on precisely the crash episodes the project studies.
+2. The Task 7 review found the test suite caught 8 of 18 injected faults in the
+   simulator. After the fix waves, every injected fault is caught. That is a
+   measurable statement about test effectiveness rather than about the system.
