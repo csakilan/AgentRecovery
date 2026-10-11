@@ -55,14 +55,26 @@ class RequestBudget:
     def claim(self, n: int = 1) -> int:
         if n < 1:
             raise ValueError("n must be at least 1")
+        # One statement, two guards. A first claim of the day takes the INSERT path, and the
+        # DO UPDATE ... WHERE below never runs there, so the INSERT itself is made
+        # conditional: it selects from the claim only `WHERE n <= limit`, so an oversized
+        # claim yields no row to insert and nothing to conflict. When a row exists, the claim
+        # yields one candidate row, the conflict fires, and the update's own WHERE checks the
+        # running total. Either way a refusal returns no row and writes nothing.
+        #
+        # The claim sits in a MATERIALIZED CTE as an unbounded numeric. Without that, Postgres
+        # folds the numeric-to-INTEGER cast for the column at plan time, so a claim beyond the
+        # 32-bit range raises NumericValueOutOfRange before the WHERE can refuse it.
         row = self._conn.execute(
-            "INSERT INTO request_budget (day, requests_made) VALUES (%s, %s)"
+            "WITH claim AS MATERIALIZED (SELECT %s::date AS day, %s::numeric AS n)"
+            " INSERT INTO request_budget (day, requests_made)"
+            " SELECT day, n FROM claim WHERE n <= %s"
             " ON CONFLICT (day) DO UPDATE SET requests_made ="
             "   request_budget.requests_made + EXCLUDED.requests_made,"
             "   updated_at = now()"
             " WHERE request_budget.requests_made + EXCLUDED.requests_made <= %s"
             " RETURNING requests_made",
-            (self._today(), n, self._limit),
+            (self._today(), n, self._limit, self._limit),
         ).fetchone()
         if row is None:
             raise BudgetExceeded(f"claiming {n} would exceed the daily limit of {self._limit}")
