@@ -1,5 +1,6 @@
 """A consumed fault-schedule slot and its call-log record must never disagree (D9)."""
 
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -290,3 +291,53 @@ def test_the_crash_signal_check_sees_a_real_crash(conn, monkeypatch):
         ("charge", service.SERVER_ERROR),
         ("status", service.IN_FLIGHT),
     ]
+
+
+def _permitted_outcomes(conn):
+    definition = conn.execute(
+        "SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint"
+        " WHERE conrelid = 'call_log'::regclass AND conname = 'call_log_outcome_check'"
+    ).fetchone()["d"]
+    return set(re.findall(r"'([a-z_]+)'::text", definition))
+
+
+def test_every_outcome_the_service_writes_is_permitted_and_nothing_else_is(conn, monkeypatch):
+    """Drive a real episode through every path that writes an outcome.
+
+    call_log_outcome_check (migration 0003) must allow each value the service can write,
+    or that path would fail at runtime, and must allow nothing the service never writes,
+    or it would stop guarding against a typo. A new outcome therefore has to come with a
+    migration, and the path that writes it has to be added here.
+    """
+    plan = FaultPlan(
+        charge={3: "error_no_commit", 4: "commit_then_error", 5: "commit_then_error"},
+        status_unavailable_calls=1,
+    )
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, plan)
+    service.charge(conn, "ns", dict(CHARGE))  # committed
+    service.charge(conn, "ns", dict(CHARGE))  # replayed
+    service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k2"})  # error_no_commit
+    service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k3"})  # committed_then_error
+    service.charge(conn, "ns", dict(CHARGE))  # existing_then_error
+    service.charge(conn, "ns", {**CHARGE, "order_id": "other"})  # conflict
+    service.charge(conn, "ns", {"idempotency_key": "k1"})  # invalid
+    service.status(conn, "ns", "k1")  # unavailable
+    service.status(conn, "ns", "k1")  # succeeded
+    service.status(conn, "ns", "nope")  # not_found
+    with monkeypatch.context() as m:
+        m.setattr(service, "_insert_or_get", _boom)
+        with pytest.raises(RuntimeError):
+            service.charge(conn, "ns", {**CHARGE, "idempotency_key": "k9"})  # server_error
+    service._claim_call(conn, "ns", "charge", "charge_calls", "k10", {})  # in_flight
+
+    written = {r["outcome"] for r in conn.execute("SELECT outcome FROM call_log").fetchall()}
+    assert len(written) == 12, written  # the episode really reached all twelve
+    assert written == _permitted_outcomes(conn)
+
+
+def test_an_unlisted_outcome_is_refused_when_a_call_is_finished(conn):
+    service.configure_namespace(conn, "ns", Profile.CONTROLLED, FaultPlan())
+    _, log_id = service._claim_call(conn, "ns", "charge", "charge_calls", "k1", {})
+    resp = service.SimResponse(200, {})
+    with pytest.raises(psycopg.errors.CheckViolation):
+        service._finish_call(conn, log_id, resp, "commited", time.perf_counter())

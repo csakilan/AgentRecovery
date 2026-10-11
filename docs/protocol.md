@@ -192,6 +192,11 @@ reused_key_on_retry, n_charge_attempts) is always reported beside it. Its effect
 amount, order, currency and the agent's claim, so a single wrong-amount charge scores
 correct. Its attempt fields come from the call log, as the next paragraph explains.
 
+`call_log.outcome` takes one of twelve values, enforced by a CHECK constraint (migration
+`0003_call_log_outcome_check.sql`): `in_flight`, `server_error`, `invalid`, `committed`,
+`replayed`, `conflict`, `committed_then_error`, `existing_then_error`, `error_no_commit`,
+`succeeded`, `not_found` and `unavailable`. A new value needs a migration.
+
 The call log holds one row per attempt, and the oracle counts every row that has a call
 index, whatever its outcome. A row exists from the moment the call's slot is claimed:
 while the call is running, and permanently if its worker dies mid-call, the row's outcome

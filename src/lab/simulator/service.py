@@ -39,6 +39,10 @@ CONFLICT_MESSAGE = (
 STATUS_UNAVAILABLE_MESSAGE = "payment status service is temporarily unavailable."
 SERVER_ERROR_MESSAGE = "the simulator failed while handling this call."
 
+# Every call_log outcome this module writes must be listed in the CHECK constraint of
+# migration 0003_call_log_outcome_check.sql. A new outcome needs a new migration extending it,
+# and a path in tests/simulator/test_call_accounting.py that writes it.
+#
 # Call-log outcome of a call whose slot is claimed but whose result is not yet recorded.
 IN_FLIGHT = "in_flight"
 # Call-log outcome of a call that raised after its slot was claimed.
