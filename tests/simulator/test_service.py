@@ -321,14 +321,107 @@ def test_non_finite_amount_claims_no_slot(conn):
     assert service.charge(conn, ns, dict(CHARGE)).http_status == 504  # still call 1
 
 
-def test_a_payload_postgres_cannot_store_never_turns_the_400_into_a_500(conn, caplog):
-    """A NUL character is valid in a JSON string but not in jsonb, so the log write fails."""
+def test_a_failing_log_write_never_turns_the_400_into_a_500(conn, monkeypatch, caplog):
+    """The 400 is the contract. If the log row cannot be written, the 400 still stands."""
     ns = make_ns(conn)
+
+    def refuse(*args, **kwargs):
+        raise psycopg.errors.DataError("injected")
+
+    monkeypatch.setattr(service, "_log", refuse)
     with caplog.at_level("ERROR", logger="lab.simulator.service"):
-        r = service.charge(conn, ns, {**CHARGE, "note": "a\u0000b"})
-    assert r.http_status == 400  # the extra field is what makes it invalid
+        r = service.charge(conn, ns, {**CHARGE, "note": "x"})
+    assert r.http_status == 400
     assert _outcomes(conn, ns) == []  # the row was lost, and said so
     assert any(rec.exc_info for rec in caplog.records)
+
+
+# JSON strings may hold any code point, Postgres text and jsonb cannot hold these two.
+UNSTORABLE = [("NUL", "a\x00b"), ("unpaired surrogate", "a\ud800b")]
+ESCAPED = {"a\x00b": "a\\u0000b", "a\ud800b": "a\\ud800b"}
+
+
+def _only_log_row(conn, ns):
+    rows = conn.execute(
+        "SELECT endpoint, call_index, idempotency_key, request, outcome FROM call_log"
+        " WHERE namespace = %s ORDER BY id",
+        (ns,),
+    ).fetchall()
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+@pytest.mark.parametrize("profile", [Profile.COMPAT, Profile.CONTROLLED])
+@pytest.mark.parametrize(("label", "bad"), UNSTORABLE)
+def test_unstorable_idempotency_key_is_a_logged_400_that_claims_no_slot(conn, profile, label, bad):
+    ns = make_ns(conn, World.LOST_ACK, profile=profile)
+    good = CHARGE if profile is Profile.CONTROLLED else COMPAT_CHARGE
+    r = service.charge(conn, ns, {**good, "idempotency_key": bad})
+    assert r.http_status == 400, label
+    assert r.body == {
+        "error": {
+            "code": "invalid_request",
+            "message": "idempotency_key must not contain a NUL character or an unpaired surrogate",
+        }
+    }
+    row = _only_log_row(conn, ns)
+    assert (row["endpoint"], row["call_index"], row["outcome"]) == ("charge", None, "invalid")
+    # The evidence is kept, with the character made visible.
+    assert row["idempotency_key"] == ESCAPED[bad]
+    assert row["request"]["idempotency_key"] == ESCAPED[bad]
+    assert charges(conn, ns) == []
+    # It consumed nothing: the next call is still call 1, which the lost_ack plan faults.
+    assert service.charge(conn, ns, dict(good)).http_status == 504
+
+
+@pytest.mark.parametrize(("label", "bad"), UNSTORABLE)
+def test_unstorable_order_id_is_a_logged_400_that_claims_no_slot(conn, label, bad):
+    ns = make_ns(conn, World.LOST_ACK)
+    r = service.charge(conn, ns, {**CHARGE, "order_id": bad})
+    assert r.http_status == 400, label
+    assert r.body["error"] == {
+        "code": "invalid_request",
+        "message": "order_id must not contain a NUL character or an unpaired surrogate",
+    }
+    row = _only_log_row(conn, ns)
+    assert (row["call_index"], row["outcome"]) == (None, "invalid")
+    assert row["request"]["order_id"] == ESCAPED[bad]
+    assert service.charge(conn, ns, dict(CHARGE)).http_status == 504
+
+
+@pytest.mark.parametrize(("label", "bad"), UNSTORABLE)
+def test_unstorable_text_in_an_unexpected_field_is_still_logged(conn, label, bad):
+    """Both the field's name and its value reach the request and the echoed error message."""
+    ns = make_ns(conn)
+    r = service.charge(conn, ns, {**CHARGE, "note" + bad: bad})
+    assert r.http_status == 400
+    row = _only_log_row(conn, ns)
+    assert (row["call_index"], row["outcome"]) == (None, "invalid")
+    assert row["request"]["note" + ESCAPED[bad]] == ESCAPED[bad]
+
+
+@pytest.mark.parametrize(("label", "bad"), UNSTORABLE)
+def test_unstorable_status_key_is_a_logged_not_found(conn, label, bad):
+    """Status has no validation stage, so the call still claims its slot and is counted."""
+    ns = make_ns(conn)
+    r = service.status(conn, ns, bad)
+    assert (r.http_status, r.body["status"]) == (200, "NOT_FOUND"), label
+    row = _only_log_row(conn, ns)
+    assert (row["endpoint"], row["call_index"], row["outcome"]) == ("status", 1, "not_found")
+    assert row["idempotency_key"] == ESCAPED[bad]
+
+
+@pytest.mark.parametrize(
+    "ok", ["a\tb", "a\nb", "a\x01b", "a\x7fb", "a\u2028b", "a\u202eb", "a\U0001f600b"]
+)
+def test_other_control_and_unusual_characters_remain_valid_keys(conn, ok):
+    """Postgres stores these without trouble, so rejecting them would only narrow the input."""
+    ns = make_ns(conn)
+    first = service.charge(conn, ns, {**CHARGE, "idempotency_key": ok, "order_id": ok})
+    assert first.http_status == 200
+    again = service.charge(conn, ns, {**CHARGE, "idempotency_key": ok, "order_id": ok})
+    assert again.body["replayed"] is True
+    assert service.status(conn, ns, ok).body["status"] == "SUCCEEDED"
 
 
 def test_call_log_outcome_error_no_commit(conn):

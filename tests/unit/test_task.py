@@ -64,6 +64,26 @@ def test_args_hash_is_stable_across_equivalent_amounts():
     assert len(a) == 64
 
 
+def test_args_hash_has_a_pinned_value():
+    """The hash is a payment's identity across processes and across time.
+
+    Stored hashes are compared with freshly computed ones to tell a replay from a
+    conflict, so changing the canonical form (key order, separators, amount formatting,
+    the digest) would silently reclassify every existing record. These literals are the
+    SHA-256 of the exact text shown, computed independently of args_hash. If one of them
+    has to change, that is a data migration, not a test update.
+    """
+    # {"amount":"49.99","currency":"USD","order_id":"1234"}
+    expected = "167d1ccd9ced3fb69741c67a087bee9bd38caf9f193efd3cd4320fca3e6f5834"
+    assert args_hash("1234", Decimal("49.99"), "USD") == expected
+    assert args_hash("1234", Decimal("49.990"), "USD") == expected
+    # {"amount":"49.99","currency":null,"order_id":null}, the compat profile's form.
+    assert (
+        args_hash(None, Decimal("49.99"), None)
+        == "491dbf547b23edc0fc6735bd675c1ab9437b13714ab2813883c57c44f119fd27"
+    )
+
+
 def test_args_hash_changes_with_any_argument():
     base = args_hash("1234", Decimal("49.99"), "USD")
     assert args_hash("1235", Decimal("49.99"), "USD") != base

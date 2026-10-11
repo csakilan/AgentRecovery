@@ -7,13 +7,16 @@ one effect instead of creating another.
 Only the public API and the internal control API are used; the database is never opened.
 """
 
+import os
 import sys
 import uuid
 
 import httpx
 
-PUBLIC = "http://localhost:8100"
-INTERNAL = "http://localhost:8101"
+# The Compose stack publishes these ports on the host. CI sets the variables to 127.0.0.1
+# addresses so that "localhost" resolving to ::1 first cannot matter.
+PUBLIC = os.environ.get("SMOKE_PUBLIC_URL", "http://localhost:8100")
+INTERNAL = os.environ.get("SMOKE_INTERNAL_URL", "http://localhost:8101")
 CLIENT = {"Authorization": "Bearer dev-client-token"}
 CONTROL = {"Authorization": "Bearer dev-control-token"}
 

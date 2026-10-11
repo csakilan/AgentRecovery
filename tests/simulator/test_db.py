@@ -55,7 +55,7 @@ WRITE_STATEMENTS = {
     "call_log": {
         "INSERT": "INSERT INTO call_log (id, namespace, endpoint, request, http_status, "
         "response, outcome, server_ms) "
-        "VALUES (1000, 'seed', 'charge', '{}', 200, '{}', 'ok', 1.0)",
+        "VALUES (1000, 'seed', 'charge', '{}', 200, '{}', 'committed', 1.0)",
         "UPDATE": "UPDATE call_log SET http_status = 500",
         "DELETE": "DELETE FROM call_log",
     },
@@ -86,7 +86,7 @@ def seeded_ledger(payments_db, svc_url):
         )
         conn.execute(
             "INSERT INTO call_log (namespace, endpoint, request, http_status, response, "
-            "outcome, server_ms) VALUES ('seed', 'charge', '{}', 200, '{}', 'ok', 1.0)"
+            "outcome, server_ms) VALUES ('seed', 'charge', '{}', 200, '{}', 'committed', 1.0)"
         )
         conn.execute("INSERT INTO barriers (namespace, name) VALUES ('seed', 'b')")
     return payments_db["reader"]
@@ -210,11 +210,68 @@ def test_existing_database_is_narrowed_by_the_new_migration(payments_db, tmp_pat
             conn.execute("DELETE FROM call_log")  # allowed before, which is the exposure
 
         applied = db.apply_migrations(admin_url, SIM_MIGRATIONS)
-        assert applied == ["0002_narrow_payment_svc_grants.sql"]
+        assert applied[0] == "0002_narrow_payment_svc_grants.sql"
 
         with psycopg.connect(svc_url, autocommit=True) as conn:
             assert conn.execute("SELECT count(*) FROM sim_namespaces").fetchone()[0] == 1
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 conn.execute("DELETE FROM call_log")
+    finally:
+        db.drop_database(ADMIN_URL, name)
+
+
+def _database_at(tmp_path, upto):
+    """A scratch database migrated only as far as the named migration. Caller drops it."""
+    only = tmp_path / "migrations"
+    only.mkdir()
+    for path in sorted(SIM_MIGRATIONS.glob("*.sql")):
+        if path.name <= upto:
+            (only / path.name).write_text(path.read_text())
+    name = f"payments_upgrade_{uuid.uuid4().hex[:8]}"
+    db.ensure_database(ADMIN_URL, name)
+    admin_url = db.with_database(ADMIN_URL, name)
+    db.apply_migrations(admin_url, only)
+    return name, admin_url
+
+
+_SEED_NS = (
+    "INSERT INTO sim_namespaces (namespace, profile, fault_plan) VALUES ('x', 'compat', '{}')"
+)
+_SEED_ROW = (
+    "INSERT INTO call_log (namespace, endpoint, request, http_status, response, outcome, "
+    "server_ms) VALUES ('x', 'charge', '{}', 200, '{}', %s, 1.0)"
+)
+
+
+def test_outcome_check_is_added_to_an_existing_database_and_keeps_its_rows(payments_db, tmp_path):
+    name, admin_url = _database_at(tmp_path, "0002_narrow_payment_svc_grants.sql")
+    try:
+        with psycopg.connect(admin_url, autocommit=True) as conn:
+            conn.execute(_SEED_NS)
+            conn.execute(_SEED_ROW, ("committed",))
+        assert db.apply_migrations(admin_url, SIM_MIGRATIONS) == ["0003_call_log_outcome_check.sql"]
+        with psycopg.connect(admin_url, autocommit=True) as conn:
+            assert conn.execute("SELECT count(*) FROM call_log").fetchone()[0] == 1
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(_SEED_ROW, ("commited",))
+    finally:
+        db.drop_database(ADMIN_URL, name)
+
+
+def test_outcome_check_migration_refuses_to_run_over_an_unknown_outcome(payments_db, tmp_path):
+    """A database holding a value the code never writes must fail loudly, and change nothing."""
+    name, admin_url = _database_at(tmp_path, "0002_narrow_payment_svc_grants.sql")
+    try:
+        with psycopg.connect(admin_url, autocommit=True) as conn:
+            conn.execute(_SEED_NS)
+            conn.execute(_SEED_ROW, ("ok",))
+        with pytest.raises(psycopg.errors.CheckViolation):
+            db.apply_migrations(admin_url, SIM_MIGRATIONS)
+        with psycopg.connect(admin_url, autocommit=True) as conn:
+            assert not conn.execute(
+                "SELECT 1 FROM pg_constraint WHERE conname = 'call_log_outcome_check'"
+            ).fetchall()
+            applied = [r[0] for r in conn.execute("SELECT name FROM schema_migrations")]
+            assert "0003_call_log_outcome_check.sql" not in applied
     finally:
         db.drop_database(ADMIN_URL, name)
