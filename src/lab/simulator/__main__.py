@@ -23,11 +23,17 @@ from lab.simulator.app import create_internal_app, create_public_app
 
 
 def _pool(url: str) -> ConnectionPool:
+    # `check` runs on every checkout and discards a connection Postgres has closed (a
+    # restart, an idle timeout, a network drop) instead of handing it to a request. Without
+    # it that request fails on its first statement, which is before the call's slot is
+    # claimed, so the attempt leaves no call_log row and vanishes from n_charge_attempts.
+    # check_connection is the pool's own check: one empty query, a single round trip.
     return ConnectionPool(
         url,
         min_size=1,
         max_size=20,
         open=True,
+        check=ConnectionPool.check_connection,
         kwargs={"autocommit": True, "row_factory": dict_row},
     )
 
