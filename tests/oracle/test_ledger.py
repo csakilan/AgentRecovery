@@ -53,7 +53,31 @@ def test_read_ledger_through_the_read_only_role(payments_db, conn):
         LedgerCharge("k1", "1234", Decimal("49.99"), "USD", 1),
         LedgerCharge("k2", "1234", Decimal("49.99"), "USD", 2),
     ]
-    assert calls == CallSummary(charge_keys=("k1", "k2"), status_calls=1)
+    assert calls == CallSummary(charge_keys=("k1", "k2"), status_calls=1, invalid_charge_calls=1)
+
+
+def test_read_ledger_counts_rejected_charge_calls_without_making_them_attempts(payments_db, conn):
+    """A malformed charge claims no slot, so it is no attempt, but the evaluator must see it.
+
+    The compat legacy score matches the original only when no charge call was malformed,
+    so the count is the signal that says whether that comparison is valid for an episode.
+    """
+    service.configure_namespace(conn, "ns", Profile.COMPAT, FaultPlan())
+    service.configure_namespace(conn, "other", Profile.COMPAT, FaultPlan())
+    service.charge(conn, "ns", {"amount": 49.99})  # missing key
+    service.charge(conn, "ns", {"amount": "abc", "idempotency_key": "k1"})  # bad amount
+    service.charge(conn, "ns", {"amount": 49.99, "idempotency_key": 5})  # key not a string
+    service.charge(conn, "ns", dict(COMPAT_CHARGE))  # the one well-formed attempt
+    service.status(conn, "ns", "k1")
+    service.charge(conn, "other", {"amount": 49.99})  # another namespace's invalid call
+
+    with psycopg.connect(payments_db["reader"], autocommit=True) as reader:
+        found, calls = read_ledger(reader, "ns")
+
+    assert calls == CallSummary(charge_keys=("k1",), status_calls=1, invalid_charge_calls=3)
+    assert [c.call_index for c in found] == [1]  # the invalid calls did not claim slot 1
+    assert legacy_score(found, calls).n_charge_attempts == 1
+    assert read_ledger(conn, "other")[1].invalid_charge_calls == 1
 
 
 def test_read_ledger_ignores_other_namespaces(conn):
@@ -62,7 +86,7 @@ def test_read_ledger_ignores_other_namespaces(conn):
     service.charge(conn, "a", dict(CHARGE))
     found, calls = read_ledger(conn, "b")
     assert found == []
-    assert calls == CallSummary(charge_keys=(), status_calls=0)
+    assert calls == CallSummary(charge_keys=(), status_calls=0, invalid_charge_calls=0)
 
 
 def test_read_ledger_amount_column_is_numeric_and_reads_back_as_decimal(conn):
@@ -114,7 +138,7 @@ def test_a_crashed_attempt_still_counts_as_a_charge_attempt(conn, monkeypatch):
             service.charge(conn, "ns", dict(CHARGE))
     found, calls = read_ledger(conn, "ns")
     assert found == []
-    assert calls == CallSummary(charge_keys=("k1",), status_calls=0)
+    assert calls == CallSummary(charge_keys=("k1",), status_calls=0, invalid_charge_calls=0)
     assert legacy_score(found, calls).n_charge_attempts == 1
 
     # A later retry on the same key commits; the crashed attempt still counts toward both
@@ -151,7 +175,9 @@ def test_a_failed_compat_attempt_counts_without_filtering_on_outcome(payments_db
         with psycopg.connect(payments_db["reader"], autocommit=True) as reader:
             found, calls = read_ledger(reader, "ns")
         assert found == []
-        assert calls == CallSummary(charge_keys=("k1", "k2", "k3"), status_calls=0)
+        assert calls == CallSummary(
+            charge_keys=("k1", "k2", "k3"), status_calls=0, invalid_charge_calls=0
+        )
         assert legacy_score(found, calls).n_charge_attempts == 3
     finally:
         service.release_barrier(conn, "ns", "before_commit:3")
@@ -169,7 +195,7 @@ def test_read_ledger_during_a_request_counts_the_attempt_but_not_yet_the_effect(
         _wait_until(lambda: service.barrier_state(conn, "ns", "before_commit:1")["reached"])
         found, calls = read_ledger(reader, "ns")
         assert found == []
-        assert calls == CallSummary(charge_keys=("k1",), status_calls=0)
+        assert calls == CallSummary(charge_keys=("k1",), status_calls=0, invalid_charge_calls=0)
         assert legacy_score(found, calls).n_charge_attempts == 1
 
         service.release_barrier(conn, "ns", "before_commit:1")
@@ -177,7 +203,7 @@ def test_read_ledger_during_a_request_counts_the_attempt_but_not_yet_the_effect(
         assert result["response"].http_status == 200
         found, calls = read_ledger(reader, "ns")
         assert [c.idempotency_key for c in found] == ["k1"]
-        assert calls == CallSummary(charge_keys=("k1",), status_calls=0)
+        assert calls == CallSummary(charge_keys=("k1",), status_calls=0, invalid_charge_calls=0)
 
 
 def test_read_ledger_after_commit_but_before_the_response_sees_one_effect_one_attempt(
@@ -189,7 +215,7 @@ def test_read_ledger_after_commit_but_before_the_response_sees_one_effect_one_at
         _wait_until(lambda: service.barrier_state(conn, "ns", "after_commit:1")["reached"])
         found, calls = read_ledger(reader, "ns")
         assert [c.idempotency_key for c in found] == ["k1"]
-        assert calls == CallSummary(charge_keys=("k1",), status_calls=0)
+        assert calls == CallSummary(charge_keys=("k1",), status_calls=0, invalid_charge_calls=0)
         service.release_barrier(conn, "ns", "after_commit:1")
         thread.join(5)
     assert result["response"].http_status == 200
@@ -254,6 +280,6 @@ def test_read_ledger_issues_exactly_one_sql_statement(payments_db, conn):
 
     # Both halves came back, so the one statement really did cover charges and call_log.
     assert [c.idempotency_key for c in found] == ["k1"]
-    assert calls == CallSummary(charge_keys=("k1",), status_calls=1)
+    assert calls == CallSummary(charge_keys=("k1",), status_calls=1, invalid_charge_calls=0)
     assert len(executed) == 1
     assert "charges" in executed[0] and "call_log" in executed[0]

@@ -22,7 +22,7 @@ RECOVERABLE = Expectation(
 NO_EFFECT_EXPECTED = Expectation(
     Profile.CONTROLLED, DEFAULT_TASK, expect_effect=False, eligible_recoverable=False
 )
-ONE_CALL = CallSummary(charge_keys=("k1",), status_calls=0)
+ONE_CALL = CallSummary(charge_keys=("k1",), status_calls=0, invalid_charge_calls=0)
 
 
 def ch(amount="49.99", key="k1", order_id="1234", currency="USD"):
@@ -139,7 +139,7 @@ def test_unresolved_with_no_effect_is_missed_but_truthful():
 
 
 def test_legacy_score_matches_original_field_names_and_logic():
-    calls = CallSummary(charge_keys=("k1", "k1"), status_calls=1)
+    calls = CallSummary(charge_keys=("k1", "k1"), status_calls=1, invalid_charge_calls=0)
     legacy = legacy_score([ch()], calls)
     assert asdict(legacy) == {
         "effect_count": 1,
@@ -167,7 +167,7 @@ def test_expectation_from_spec():
 
 
 def test_score_episode_plumbs_the_call_summary_into_the_legacy_fields():
-    calls = CallSummary(charge_keys=("ka", "kb", "kb"), status_calls=3)
+    calls = CallSummary(charge_keys=("ka", "kb", "kb"), status_calls=3, invalid_charge_calls=0)
     legacy = score([ch()], "succeeded", calls=calls).legacy
     assert asdict(legacy) == {
         "effect_count": 1,
@@ -182,18 +182,30 @@ def test_score_episode_plumbs_the_call_summary_into_the_legacy_fields():
 
 
 def test_checked_status_is_a_flag_not_a_count():
-    many = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=5))
-    one = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=1))
-    none = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=0))
+    many = legacy_score(
+        [ch()], CallSummary(charge_keys=("k1",), status_calls=5, invalid_charge_calls=0)
+    )
+    one = legacy_score(
+        [ch()], CallSummary(charge_keys=("k1",), status_calls=1, invalid_charge_calls=0)
+    )
+    none = legacy_score(
+        [ch()], CallSummary(charge_keys=("k1",), status_calls=0, invalid_charge_calls=0)
+    )
     assert many.checked_status == 1
     assert one.checked_status == 1
     assert none.checked_status == 0
 
 
 def test_reused_key_on_retry_needs_at_least_two_attempts():
-    single = legacy_score([ch()], CallSummary(charge_keys=("k1",), status_calls=0))
-    same = legacy_score([ch()], CallSummary(charge_keys=("k1", "k1"), status_calls=0))
-    distinct = legacy_score([ch()], CallSummary(charge_keys=("k1", "k2"), status_calls=0))
+    single = legacy_score(
+        [ch()], CallSummary(charge_keys=("k1",), status_calls=0, invalid_charge_calls=0)
+    )
+    same = legacy_score(
+        [ch()], CallSummary(charge_keys=("k1", "k1"), status_calls=0, invalid_charge_calls=0)
+    )
+    distinct = legacy_score(
+        [ch()], CallSummary(charge_keys=("k1", "k2"), status_calls=0, invalid_charge_calls=0)
+    )
     assert single.reused_key_on_retry == 0
     assert single.n_charge_attempts == 1
     assert same.reused_key_on_retry == 1
