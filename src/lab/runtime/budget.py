@@ -3,6 +3,29 @@
 Two independent guards. The allowlist refuses any model whose ID does not end
 in ":free", because D1 permits no paid usage at all. The counter lives in the
 database rather than in a process, so running a second runner cannot defeat it.
+
+The day boundary
+----------------
+The counter is keyed on the UTC calendar date, so the allowance resets at
+00:00:00 UTC and at no other instant. The date is read from the runner's own
+clock on every call to `claim` and `used_today`, in UTC whatever the machine's
+local zone, and not from the database's clock. Runners that share a budget
+should therefore keep their clocks in sync, or one that runs a few minutes
+fast will count its first claims of a day against the day before.
+
+A run that is in flight across midnight is not interrupted and not reconciled.
+Claims made before midnight stay on the old day: they are not carried into the
+new one and not refunded. The first claim after midnight starts a new row with
+a full allowance, so a run that was being refused at the limit simply continues,
+and one that straddles midnight can spend up to twice the daily limit in the
+time around it.
+
+This is an assumption about the provider, not something verified. D11 records
+the provider's daily ceiling but not the instant at which its window resets. If
+that window is rolling, or is anchored to another zone, then two consecutive
+UTC days of the full limit can fall inside one provider day, and the true
+ceiling would be exceeded even though this counter never was. Until the reset
+instant is confirmed, `daily_limit` is a guarantee about UTC days only.
 """
 
 from __future__ import annotations
@@ -44,6 +67,7 @@ class RequestBudget:
 
     @staticmethod
     def _today() -> str:
+        # The UTC date, from this process's clock. See "The day boundary" in the module docstring.
         return datetime.now(UTC).date().isoformat()
 
     def used_today(self) -> int:

@@ -1,10 +1,12 @@
 import threading
 import time
 from collections import Counter
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import psycopg
 import pytest
 
+from lab.runtime import budget as budget_module
 from lab.runtime.budget import (
     BudgetExceeded,
     ModelNotAllowed,
@@ -141,6 +143,75 @@ def test_claiming_one_at_a_time_reaches_the_limit_exactly(runtime_conn):
     with pytest.raises(BudgetExceeded):
         budget.claim()
     assert budget.used_today() == 25
+
+
+# A zone whose calendar date runs ahead of UTC's for 14 hours of every day. Under it, a clock
+# that forgets to ask for UTC reads a different date from the UTC one for much of the day.
+_AHEAD_OF_UTC = timezone(timedelta(hours=14))
+
+
+class _Clock:
+    """A settable stand-in for `datetime` inside the budget module.
+
+    `now(tz)` converts the current instant into `tz`, as the real one does. Called with no
+    zone it answers in `_AHEAD_OF_UTC`, naive, which is what a machine's local time would be.
+    """
+
+    def __init__(self, monkeypatch, instant):
+        self.instant = instant
+        clock = self
+
+        class FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return clock.instant.astimezone(_AHEAD_OF_UTC).replace(tzinfo=None)
+                return clock.instant.astimezone(tz)
+
+        monkeypatch.setattr(budget_module, "datetime", FakeDatetime)
+
+
+def _days(conn):
+    return conn.execute("SELECT day, requests_made FROM request_budget ORDER BY day").fetchall()
+
+
+def test_the_budget_day_is_the_utc_date_not_the_local_one(runtime_conn, monkeypatch):
+    # 23:30 UTC on the 11th is already the 12th at UTC+14, so the two readings disagree here.
+    _Clock(monkeypatch, datetime(2026, 10, 11, 23, 30, tzinfo=UTC))
+    budget = RequestBudget(runtime_conn, daily_limit=5)
+    budget.claim(2)
+    assert _days(runtime_conn) == [(date(2026, 10, 11), 2)]
+
+
+def test_the_day_rolls_over_at_utc_midnight_exactly(runtime_conn, monkeypatch):
+    clock = _Clock(monkeypatch, datetime(2026, 10, 11, 23, 59, 59, 999999, tzinfo=UTC))
+    budget = RequestBudget(runtime_conn, daily_limit=5)
+    assert budget.claim(5) == 5
+    with pytest.raises(BudgetExceeded):
+        budget.claim()
+
+    # One microsecond later it is a new UTC day with a fresh allowance.
+    clock.instant = datetime(2026, 10, 12, 0, 0, 0, tzinfo=UTC)
+    assert budget.used_today() == 0
+    assert budget.claim(5) == 5
+    assert _days(runtime_conn) == [(date(2026, 10, 11), 5), (date(2026, 10, 12), 5)]
+
+
+def test_a_run_in_flight_across_midnight_gets_a_new_allowance_and_loses_nothing(
+    runtime_conn, monkeypatch
+):
+    """What the module docstring promises: claims made before midnight stay on the old day,
+    are not carried forward and are not refunded."""
+    clock = _Clock(monkeypatch, datetime(2026, 10, 11, 23, 59, 58, tzinfo=UTC))
+    budget = RequestBudget(runtime_conn, daily_limit=5)
+    budget.claim(4)
+
+    clock.instant = datetime(2026, 10, 12, 0, 0, 2, tzinfo=UTC)
+    assert budget.used_today() == 0, "the old day's claims do not count against the new day"
+    assert budget.claim(3) == 3
+
+    clock.instant = datetime(2026, 10, 11, 23, 59, 59, tzinfo=UTC)
+    assert budget.used_today() == 4, "and the old day's total is untouched by the new day"
 
 
 # How long a worker waits at the barrier for the others. A worker that fails before it gets
