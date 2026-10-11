@@ -100,12 +100,3 @@ def admin_url():
 @pytest.fixture(scope="session")
 def runtime_svc_password():
     return RUNTIME_SVC_PASSWORD
-
-
-@pytest.fixture
-def runtime_conn(runtime_db):
-    """A service-role connection with default (tuple) rows, as the runtime code indexes
-    results by position. The tables are already empty: the autouse fixture in
-    tests/runtime/conftest.py truncates them before every test."""
-    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
-        yield conn

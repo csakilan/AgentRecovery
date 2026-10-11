@@ -42,3 +42,17 @@ def _empty_runtime_tables(truncate_runtime_tables):
     collide with the next.
     """
     truncate_runtime_tables()
+
+
+@pytest.fixture
+def runtime_conn(runtime_db, _empty_runtime_tables):
+    """A service-role connection with default (tuple) rows, as the runtime code indexes
+    results by position.
+
+    It lives here, below `_empty_runtime_tables`, because it relies on that fixture to hand
+    it empty tables, and asks for it by name so the order is enforced rather than assumed.
+    Defined in the root conftest it would be visible to tests that have no such fixture and
+    would silently share rows between them.
+    """
+    with psycopg.connect(runtime_db["svc"], autocommit=True) as conn:
+        yield conn

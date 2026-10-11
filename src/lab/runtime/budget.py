@@ -30,11 +30,19 @@ instant is confirmed, `daily_limit` is a guarantee about UTC days only.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 import psycopg
 
 FREE_SUFFIX = ":free"
+
+# What may precede the suffix: an ID that starts with a letter or digit and continues with
+# letters, digits and . _ / - only. That excludes whitespace, control and zero-width
+# characters, commas (a list of IDs) and further colons (":free:free") in one rule, and the
+# free IDs this project uses all fit it. A provider would reject most of what this refuses
+# without charging, so the point is to refuse it here, before it is sent, not to save money.
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
 class BudgetExceeded(Exception):
@@ -48,8 +56,12 @@ class ModelNotAllowed(Exception):
 def assert_model_allowed(model_id: str) -> None:
     if not model_id.endswith(FREE_SUFFIX):
         raise ModelNotAllowed(f"{model_id!r} is not a :free model")
-    if len(model_id) <= len(FREE_SUFFIX):
+    name = model_id[: -len(FREE_SUFFIX)]
+    if not name:
         raise ModelNotAllowed(f"{model_id!r} has no model name before {FREE_SUFFIX}")
+    # fullmatch, not `$`: `$` would let a name ending in a newline through.
+    if _MODEL_NAME.fullmatch(name) is None:
+        raise ModelNotAllowed(f"{model_id!r} is not a well-formed model ID")
 
 
 class RequestBudget:
@@ -77,6 +89,10 @@ class RequestBudget:
         return 0 if row is None else int(row[0])
 
     def claim(self, n: int = 1) -> int:
+        # A bool is an int in Python, and a float or Decimal would be rounded by the database
+        # on its way into the INTEGER column, silently consuming more than was asked for.
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise ValueError(f"n must be an integer, not {type(n).__name__}")
         if n < 1:
             raise ValueError("n must be at least 1")
         # One statement, two guards. A first claim of the day takes the INSERT path, and the

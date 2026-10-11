@@ -2,6 +2,7 @@ import threading
 import time
 from collections import Counter
 from datetime import UTC, date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import psycopg
 import pytest
@@ -21,10 +22,16 @@ from lab.runtime.budget import (
         "google/gemma-4-31b-it:free",
         "nvidia/nemotron-3-ultra-550b-a55b:free",
         "thinkingmachines/inkling:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-r1-0528:free",
     ],
 )
 def test_free_models_are_allowed(model_id):
-    assert_model_allowed(model_id)
+    assert assert_model_allowed(model_id) is None
+    # The same ID without its suffix is refused. Without this half, a function that allows
+    # everything would pass, since allowing is all this test can otherwise observe.
+    with pytest.raises(ModelNotAllowed):
+        assert_model_allowed(model_id.removesuffix(":free"))
 
 
 @pytest.mark.parametrize(
@@ -42,6 +49,36 @@ def test_free_models_are_allowed(model_id):
 def test_everything_else_is_refused(model_id):
     """D1 allows no paid usage, so the allowlist is a code-level guard rather
     than a configuration value someone can mistype."""
+    with pytest.raises(ModelNotAllowed):
+        assert_model_allowed(model_id)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        pytest.param(" openai/gpt-5:free", id="leading-space"),
+        pytest.param("\topenai/gpt-5:free", id="leading-tab"),
+        pytest.param("openai/gpt-5\n:free", id="newline-before-suffix"),
+        pytest.param("openai/gpt-5\x00:free", id="nul-before-suffix"),
+        pytest.param("openai/gpt-5\u200b:free", id="zero-width-space"),
+        pytest.param("openai/gpt-5,google/gemma:free", id="comma-separated-list"),
+        pytest.param("openai/gpt-5 google/gemma:free", id="space-separated-list"),
+        pytest.param(" :free", id="space-only-name"),
+        pytest.param("\n:free", id="newline-only-name"),
+        pytest.param(":free:free", id="suffix-repeated-as-name"),
+        pytest.param("google/gemma:free:free", id="suffix-repeated"),
+        pytest.param("google/gemma:free ", id="trailing-space"),
+        pytest.param("google/gemma:free\n", id="trailing-newline"),
+        pytest.param("google/gemma:FREE", id="upper-case-suffix"),
+        pytest.param("google/gemma:Free", id="title-case-suffix"),
+        pytest.param("google/gemma\uff1afree", id="full-width-colon"),
+        pytest.param("google/gemma:freemium", id="longer-suffix"),
+        pytest.param("-/-:free", id="name-starts-with-punctuation"),
+    ],
+)
+def test_malformed_ids_are_refused_even_when_they_look_free(model_id):
+    """A bare suffix test lets these through. None of them costs money, since a provider
+    rejects them or they name a free model anyway, but they are refused before being sent."""
     with pytest.raises(ModelNotAllowed):
         assert_model_allowed(model_id)
 
@@ -78,6 +115,31 @@ def test_requires_autocommit(runtime_db):
         with pytest.raises(ValueError, match="autocommit"):
             RequestBudget(c)
         assert c.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+
+
+@pytest.mark.parametrize("n", [0, -1, -(10**6)])
+def test_claim_rejects_a_non_positive_n(runtime_conn, n):
+    """Without this a negative claim would decrement the counter and hand budget back."""
+    budget = RequestBudget(runtime_conn, daily_limit=5)
+    with pytest.raises(ValueError, match="at least 1"):
+        budget.claim(n)
+    assert _rows(runtime_conn) == []
+    assert budget.used_today() == 0
+
+
+@pytest.mark.parametrize(
+    "n",
+    [1.5, 2.0, Decimal("3.5"), float("nan"), True, False, "3", None],
+    ids=repr,
+)
+def test_claim_rejects_an_n_that_is_not_a_genuine_int(runtime_conn, n):
+    """A float would be rounded by the database and consume more than asked for, a bool is an
+    int in Python but not a count, and a string or None is not a number at all."""
+    budget = RequestBudget(runtime_conn, daily_limit=5)
+    with pytest.raises(ValueError, match="integer"):
+        budget.claim(n)
+    assert _rows(runtime_conn) == []
+    assert budget.used_today() == 0
 
 
 def _rows(conn):
