@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from lab.agent._profile import coerce_profile
 from lab.protocol.task import Profile
 
 # Recorded in the experiment config. Bump it on any change to the schemas below.
@@ -109,12 +110,7 @@ def tool_schemas(profile: Profile, status_available: bool) -> list[dict[str, Any
     `status_available=False` drops `get_payment_status`, as the original does when `verify`
     is off. That is the behaviour study's experimental variable.
     """
-    try:
-        profile = Profile(profile)
-    except ValueError:
-        raise ValueError(
-            f"unknown profile {profile!r}; expected one of {[p.value for p in Profile]}"
-        ) from None
+    profile = coerce_profile(profile)
     source = _CONTROLLED if profile is Profile.CONTROLLED else _COMPAT
     return [
         copy.deepcopy(tool) for tool in source if status_available or tool["name"] != _STATUS_TOOL

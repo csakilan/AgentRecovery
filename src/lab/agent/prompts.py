@@ -1,8 +1,14 @@
 """The text the model is told, versioned so a frozen run can be reproduced.
 
-Compat output is RetryLedger's, character for character, and tests/agent/test_tools_prompts.py
-compares it against the vendored original. Controlled output is the compat text with the
-currency added to the user message (roadmap section 3.2).
+Compat output is RetryLedger's character for character at DEFAULT_TASK (order 1234, 49.99
+USD), which is the task every episode uses, and tests/agent/test_tools_prompts.py compares it
+against the vendored original there. The original hard-codes that one task, so it defines no
+output for any other. For another amount the user message renders the Decimal as written
+(`Decimal("12.50")` gives `$12.50`, where the original's float formatting would give `$12.5`;
+`Decimal("10")` gives `10`, not `10.0`). That is deliberate, a price keeps its trailing zero,
+and it is pinned by a test as a documented divergence, not as parity. The system prompts
+and the tool schemas are fixed text with no such dependence. Controlled output is the compat
+text with the currency added to the user message (roadmap section 3.2).
 
 The system prompt takes only a variant, not a profile: the original's three system prompts
 say nothing about the payload fields, so the same text serves both profiles, and varying it
@@ -11,6 +17,7 @@ would add a second difference between them beyond the one the controlled profile
 
 from __future__ import annotations
 
+from lab.agent._profile import coerce_profile
 from lab.protocol.manifest import PromptVariant
 from lab.protocol.task import ChargeTask, Profile
 
@@ -41,14 +48,7 @@ def system_prompt(variant: PromptVariant) -> str:
 
 
 def user_prompt(task: ChargeTask, profile: Profile) -> str:
-    # Profile(...) rejects anything that is not a profile, and accepts the plain strings a
-    # manifest carries, since Profile is a StrEnum.
-    try:
-        profile = Profile(profile)
-    except ValueError:
-        raise ValueError(
-            f"unknown profile {profile!r}; expected one of {[p.value for p in Profile]}"
-        ) from None
+    profile = coerce_profile(profile)
     # "f" keeps the amount as written ("49.99", "12.50") and never switches to an exponent.
     # The original formatted a float, which prints 49.99 identically but would drop the
     # trailing zero of 12.50; a price should not.
