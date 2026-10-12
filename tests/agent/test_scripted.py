@@ -171,7 +171,7 @@ def test_scripted_policies_is_exactly_the_seven_names():
 
 
 def test_an_unknown_policy_is_rejected_at_construction():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not_a_policy"):
         ScriptedModel("not_a_policy")
 
 
@@ -186,7 +186,9 @@ def test_a_policy_that_over_runs_keeps_reporting_done_and_never_charges_again(po
     planned = SEQUENCES[policy]
     final = planned[-1]
     assert final[0] == "report_done"
-    extra = 5
+    # Far past the end: a policy that charged again after, say, 12 observations would
+    # pass a short over-run, and a real loop only stops at its own turn cap.
+    extra = 50
     emitted = flat(policy, len(planned) + extra)
     assert emitted[: len(planned)] == planned
     assert emitted[len(planned) :] == [final] * extra
@@ -207,7 +209,8 @@ def test_a_policy_that_over_runs_keeps_reporting_done_and_never_charges_again(po
     ],
 )
 def test_what_each_policy_reports_when_its_sequence_is_spent(policy, outcome):
-    assert SEQUENCES[policy][-1] == done(outcome)
+    """Asks the implementation: the last of 50 turns is the policy's standing report."""
+    assert flat(policy, 50)[-1] == done(outcome)
 
 
 def test_stable_key_and_check_status_both_retry_under_k1():
@@ -242,14 +245,14 @@ def test_only_the_malformed_policys_first_turn_is_flagged_malformed():
         model = ScriptedModel(policy)
         messages = [{"role": "user", "content": "charge it"}]
         flags = []
-        for i in range(6):
+        for i in range(15):
             turn = model.complete(messages, CHARGE_TOOLS)
             flags.append(turn.malformed)
             messages.append({"role": "tool", "content": f"obs {i}"})
         if policy == "malformed_call":
-            assert flags == [True, False, False, False, False, False]
+            assert flags == [True] + [False] * 14
         else:
-            assert flags == [False] * 6, policy
+            assert flags == [False] * 15, policy
 
 
 @pytest.mark.parametrize("policy", SCRIPTED_POLICIES)
@@ -300,6 +303,26 @@ def test_tool_call_ids_are_distinct_within_a_conversation(policy):
         ids.extend(call.id for call in turn.tool_calls)
         messages.append({"role": "tool", "content": f"obs {i}"})
     assert len(ids) == len(set(ids)) == 6
+
+
+@pytest.mark.parametrize("policy", SCRIPTED_POLICIES)
+def test_tool_call_ids_are_the_policy_name_and_the_tool_message_count(policy):
+    """Replay keys on these ids, so the format is pinned exactly. The conversation carries
+    an assistant message per turn, so counting messages instead of tool messages would
+    give different numbers."""
+    calls = drive(policy, ["HTTP 504 Gateway Timeout: ...", "obs", "obs", "obs"])
+    assert [c[0].id for c in calls] == [f"scripted_{policy}_{n}" for n in range(5)]
+
+
+@pytest.mark.parametrize("policy", SCRIPTED_POLICIES)
+def test_raw_records_the_policy_and_turn_and_text_is_none(policy):
+    model = ScriptedModel(policy)
+    messages = [{"role": "user", "content": "charge it"}]
+    for n in range(8):
+        turn = model.complete(messages, CHARGE_TOOLS)
+        assert turn.raw == {"scripted": True, "policy": policy, "turn": n}
+        assert turn.text is None
+        messages.append({"role": "tool", "content": f"obs {n}"})
 
 
 def test_a_fresh_model_instance_produces_identical_ids_and_raw():

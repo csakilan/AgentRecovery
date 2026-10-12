@@ -31,6 +31,14 @@ truthful and succeeded is a lie). wrong_amount in `true_fail` never commits its
 wrong charge, so it degrades to FALSE_SUCCESS. malformed_call is rejected as
 invalid before it claims a fault slot, so both worlds look the same and failed
 is truthful.
+
+Profile limitation: every charge here carries `order_id`, `amount`, `currency` and
+`idempotency_key`, which is the controlled profile's argument set. The compat
+profile's simulator accepts only `amount` and `idempotency_key` and rejects any
+other field as invalid, so under compat every charge from every policy would be
+rejected (and malformed_call would stop being the only invalid one). These
+policies are not profile-aware. Do not drive a compat episode with them; a compat
+run needs its own argument set first.
 """
 
 from __future__ import annotations
@@ -94,18 +102,16 @@ def _plan(policy: Policy) -> list[Step]:
             return [_charge("k1", amount=_WRONG_AMOUNT), _done("succeeded")]
         case "malformed_call":
             return [_charge("k1", currency=False), _done("failed")]
-    raise ValueError(f"unknown scripted policy: {policy!r}")
+    raise ValueError(f"unknown scripted policy {policy!r}; expected one of {SCRIPTED_POLICIES}")
 
 
 class ScriptedModel:
     def __init__(self, policy: Policy, model_id: str | None = None) -> None:
-        if policy not in SCRIPTED_POLICIES:
-            raise ValueError(
-                f"unknown scripted policy {policy!r}; expected one of {SCRIPTED_POLICIES}"
-            )
+        # _plan is the single place an unknown policy is rejected, so a bad name fails here,
+        # at construction, before the model exists.
+        self._plan = _plan(policy)
         self.policy: Policy = policy
         self.model_id = model_id if model_id is not None else f"scripted/{policy}"
-        self._plan = _plan(policy)
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         turn = sum(1 for message in messages if message.get("role") == "tool")
