@@ -1,0 +1,702 @@
+"""The replay experiment (plan 2, Task 7; D11): what a resumed LangGraph run does about a
+charge whose process was SIGKILLed, measured at three kill points.
+
+Layout. This pytest process hosts the payment simulator (its public app on a uvicorn thread,
+against the throwaway payments database) and orchestrates. The agent runs in a real child
+process, tests/agent/replay_worker.py, started with `sys.executable`. The child is killed
+with SIGKILL, never with an exception, and the run is resumed on the same `thread_id` in a
+second, fresh child with no hooks, `messages=None` and durability="sync". The simulator lives
+here, outside the process that dies, so a request in flight when the agent dies is still
+completed and recorded.
+
+Kill points:
+
+    before_send                     the executor wrapper blocks before the first charge is
+                                    delegated; no request has been sent.
+    after_commit_before_checkpoint  no harness hook. The namespace holds charge call 1 after
+                                    its commit (hold_after_commit=(1,)); the child is killed
+                                    while it waits for the response, then the barrier is
+                                    released.
+    after_checkpoint                the model wrapper blocks at the start of the second model
+                                    call. Before killing, the orchestrator reads the thread's
+                                    latest checkpoint and records whether it holds the tool
+                                    result.
+
+The durability contrast runs the first process under a weaker durability (the resume is
+always "sync"). At after_checkpoint, "exit" and "async" are measured as above. Because an
+orchestrator kill always lands some milliseconds after the hook parks, which is time enough
+for a background "async" checkpoint write to land, a supplementary kill point is measured
+too: after_tool_step_immediate, where the worker SIGKILLs itself the instant its second model
+call starts, under "sync" and "async". It is labelled as supplementary everywhere and is not
+one of the three kill points of the brief.
+
+The policy is `false_success` in a healthy world (no fault besides the hold), which there
+just means "charge once with key k1, then report success": any second charge request that
+reaches the simulator is a replay by the loop, not a retry by the model.
+
+The assertions pin the measured behaviour, so an upgrade of LangGraph or of the checkpointer
+that changes it fails here loudly. docs/replay-findings.md records the measurement.
+
+Environment (all optional):
+    LAB_REPLAY_REPS            repetitions per kill point (default 3)
+    LAB_REPLAY_CONTRAST_REPS   repetitions per durability-contrast test (default 2)
+    LAB_REPLAY_PARALLEL        repetitions run at once, each in its own namespace (3)
+    LAB_REPLAY_EVIDENCE        a file to append one JSON line of observations per run to
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import psycopg
+import pytest
+import uvicorn
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from lab.agent.graph import build_graph
+from lab.agent.scripted import ScriptedModel
+from lab.agent.tools import tool_schemas
+from lab.protocol.faults import FaultPlan
+from lab.protocol.task import Profile
+from lab.simulator import service
+from lab.simulator.app import create_public_app
+
+REPS = int(os.environ.get("LAB_REPLAY_REPS", "3"))
+CONTRAST_REPS = int(os.environ.get("LAB_REPLAY_CONTRAST_REPS", "2"))
+PARALLEL = max(1, int(os.environ.get("LAB_REPLAY_PARALLEL", "3")))
+EVIDENCE = os.environ.get("LAB_REPLAY_EVIDENCE")
+
+WORKER = Path(__file__).with_name("replay_worker.py")
+REPO = Path(__file__).resolve().parents[2]
+TOKEN = "client-replay"
+POLICY = "false_success"
+BARRIER = "after_commit:1"
+TOOLS = tool_schemas(Profile.CONTROLLED, status_available=True)
+
+BEFORE_SEND = "before_send"
+AFTER_COMMIT = "after_commit_before_checkpoint"
+AFTER_CHECKPOINT = "after_checkpoint"
+# Supplementary, for the durability contrast: the worker SIGKILLs itself the instant its
+# second model call starts (see replay_worker.py for why an orchestrator kill cannot do this).
+AFTER_TOOL_STEP_IMMEDIATE = "after_tool_step_immediate"
+# The worker's hook for each kill point. The commit kill point has none: the simulator holds.
+WORKER_HOOK = {
+    BEFORE_SEND: "before_send",
+    AFTER_COMMIT: "none",
+    AFTER_CHECKPOINT: "after_checkpoint",
+    AFTER_TOOL_STEP_IMMEDIATE: "after_tool_step_immediate",
+}
+
+SPAWN_TIMEOUT_S = 60.0  # a cold child imports langgraph in about 2.5 s; parallel ones slower
+_evidence_lock = threading.Lock()
+
+
+# The simulator, hosted in this process
+
+
+@pytest.fixture(scope="module")
+def sim_public_url(payments_db):
+    """The public app on a real uvicorn server on an ephemeral port, for the whole module."""
+    pool = ConnectionPool(
+        payments_db["svc"],
+        min_size=1,
+        max_size=4 * PARALLEL + 4,
+        open=True,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_public_app(pool, TOKEN), log_level="warning", lifespan="off", loop="asyncio"
+        )
+    )
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]}, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not server.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.started, "the simulator did not start"
+        yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+    finally:
+        server.should_exit = True
+        thread.join(15)
+        listener.close()
+        pool.close()
+    assert not thread.is_alive(), "the simulator did not stop"
+
+
+class Lab:
+    """Connection details plus every child process and namespace this module started, so
+    a failing test can still kill the one and release the other."""
+
+    def __init__(self, sim_url: str, payments: dict[str, str], runtime: dict[str, str]):
+        self.sim_url = sim_url
+        self.sim_svc = payments["svc"]
+        self.ledger = payments["reader"]
+        self.runtime = runtime["svc"]
+        self.children: list[subprocess.Popen[str]] = []
+        self.namespaces: list[str] = []
+        self._lock = threading.Lock()
+
+    def spawn(self, ids: dict[str, str], *, hook: str, durability: str, resume: bool):
+        command = [
+            sys.executable,
+            str(WORKER),
+            "--namespace",
+            ids["namespace"],
+            "--run-id",
+            ids["run"],
+            "--thread-id",
+            ids["thread"],
+            "--policy",
+            POLICY,
+            "--kill-point",
+            hook,
+            "--durability",
+            durability,
+        ]
+        if resume:
+            command.append("--resume")
+        env = {
+            **os.environ,
+            "LAB_REPLAY_RUNTIME_URL": self.runtime,
+            "LAB_REPLAY_SIM_URL": self.sim_url,
+            "LAB_REPLAY_CLIENT_TOKEN": TOKEN,
+            "LANGSMITH_TRACING": "false",
+            "LANGCHAIN_TRACING_V2": "false",
+        }
+        child = subprocess.Popen(
+            command, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        with self._lock:
+            self.children.append(child)
+        return child
+
+    def add_namespace(self, namespace: str) -> None:
+        with self._lock:
+            self.namespaces.append(namespace)
+
+    def cleanup(self) -> None:
+        """Kill any child still alive and release every barrier this module could hold."""
+        for child in self.children:
+            _reap(child)
+        with psycopg.connect(self.sim_svc, autocommit=True) as conn:
+            for namespace in self.namespaces:
+                service.release_barrier(conn, namespace, BARRIER)
+
+
+@pytest.fixture(scope="module")
+def lab(sim_public_url, payments_db, runtime_db):
+    lab = Lab(sim_public_url, payments_db, runtime_db)
+    try:
+        yield lab
+    finally:
+        lab.cleanup()
+
+
+def _reap(child: subprocess.Popen[str] | None) -> None:
+    if child is None:
+        return
+    if child.poll() is None:
+        child.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired, ValueError, OSError):
+        child.communicate(timeout=10)
+
+
+# Observing a run
+
+
+class _NoExecutor:
+    def execute(self, call):
+        raise AssertionError("the probe graph only reads checkpoints")
+
+
+class _NoRecorder:
+    def record_model_call(self, **kwargs):
+        raise AssertionError("the probe graph only reads checkpoints")
+
+    def record_tool_event(self, **kwargs):
+        raise AssertionError("the probe graph only reads checkpoints")
+
+
+def _tool_body(content: str) -> dict[str, Any]:
+    parsed = json.loads(content)
+    body = parsed.get("body") or {}
+    return {"http_status": parsed.get("http_status"), "replayed": body.get("replayed")}
+
+
+def _charge_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What the graph holds about the charge: one entry per `charge` tool message."""
+    return [
+        _tool_body(m["content"])
+        for m in messages
+        if m.get("role") == "tool" and m.get("name") == "charge"
+    ]
+
+
+def _checkpoint(probe, saver_conn, thread: str) -> dict[str, Any]:
+    snapshot = probe.get_state({"configurable": {"thread_id": thread}})
+    rows = saver_conn.execute(
+        "SELECT count(*) AS n FROM checkpoints WHERE thread_id = %s", (thread,)
+    ).fetchone()["n"]
+    if snapshot.created_at is None:
+        return {"exists": False, "rows": rows, "next": None, "charge_results": None}
+    return {
+        "exists": True,
+        "rows": rows,
+        "next": list(snapshot.next),
+        "charge_results": _charge_results(snapshot.values["messages"]),
+    }
+
+
+def _call_log(sim, namespace: str) -> list[dict[str, Any]]:
+    rows = sim.execute(
+        "SELECT call_index, outcome, http_status, response FROM call_log"
+        " WHERE namespace = %s AND endpoint = 'charge' ORDER BY id",
+        (namespace,),
+    ).fetchall()
+    return [
+        {
+            "call_index": r["call_index"],
+            "outcome": r["outcome"],
+            "http_status": r["http_status"],
+            "replayed": (r["response"] or {}).get("replayed"),
+        }
+        for r in rows
+    ]
+
+
+def _effects(ledger, namespace: str) -> int:
+    return ledger.execute(
+        "SELECT count(*) AS n FROM charges WHERE namespace = %s", (namespace,)
+    ).fetchone()["n"]
+
+
+def _tool_events(rt, run: str) -> list[dict[str, Any]]:
+    rows = rt.execute(
+        "SELECT turn, tool, http_status, observation FROM tool_events WHERE run_id = %s"
+        " ORDER BY id",
+        (run,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        event = {"turn": r["turn"], "tool": r["tool"], "http_status": r["http_status"]}
+        if r["tool"] == "charge":
+            event["replayed"] = _tool_body(r["observation"])["replayed"]
+        out.append(event)
+    return out
+
+
+def _model_turns(rt, run: str) -> list[int]:
+    rows = rt.execute(
+        "SELECT turn FROM model_calls WHERE run_id = %s ORDER BY turn", (run,)
+    ).fetchall()
+    return [r["turn"] for r in rows]
+
+
+def _wait(
+    predicate: Callable[[], Any], what: str, child: subprocess.Popen[str] | None = None
+) -> Any:
+    deadline = time.monotonic() + SPAWN_TIMEOUT_S
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        if child is not None and child.poll() is not None:
+            _, err = child.communicate()
+            raise AssertionError(
+                f"the worker exited ({child.returncode}) before {what}:\n{err[-3000:]}"
+            )
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def run_replay(lab: Lab, kill_point: str, rep: int, durability: str = "sync") -> dict[str, Any]:
+    """One repetition: start, reach the kill point, SIGKILL, resume, observe."""
+    suffix = uuid.uuid4().hex[:10]
+    ids = {
+        "experiment": f"e-replay-{suffix}",
+        "run": f"r-replay-{suffix}",
+        "thread": f"t-replay-{suffix}",
+        "namespace": f"replay-{suffix}",
+    }
+    obs: dict[str, Any] = {
+        "kill_point": kill_point,
+        "durability": durability,
+        "rep": rep,
+        "policy": POLICY,
+        "ids": ids,
+    }
+    first = resumed = None
+    with (
+        psycopg.connect(lab.runtime, autocommit=True, row_factory=dict_row) as rt,
+        psycopg.connect(lab.sim_svc, autocommit=True, row_factory=dict_row) as sim,
+        psycopg.connect(lab.ledger, autocommit=True, row_factory=dict_row) as ledger,
+        PostgresSaver.from_conn_string(lab.runtime) as saver,
+    ):
+        probe = build_graph(
+            ScriptedModel(POLICY),
+            _NoExecutor(),
+            TOOLS,
+            6,
+            recorder=_NoRecorder(),
+            checkpointer=saver,
+        )
+        rt.execute(
+            "INSERT INTO experiments (id, name, manifest_sha256, config_json)"
+            " VALUES (%s, 'replay', 'replay', '{}')",
+            (ids["experiment"],),
+        )
+        rt.execute(
+            "INSERT INTO runs (id, experiment_id, episode_id, namespace, mode, thread_id, state)"
+            " VALUES (%s, %s, 'replay-episode', %s, 'agent_directed', %s, 'running')",
+            (ids["run"], ids["experiment"], ids["namespace"], ids["thread"]),
+        )
+        plan = FaultPlan(hold_after_commit=(1,)) if kill_point == AFTER_COMMIT else FaultPlan()
+        service.configure_namespace(sim, ids["namespace"], Profile.CONTROLLED, plan)
+        lab.add_namespace(ids["namespace"])
+        try:
+            first = lab.spawn(
+                ids, hook=WORKER_HOOK[kill_point], durability=durability, resume=False
+            )
+
+            # 1. Wait until the child is parked at the kill point (or, for the immediate
+            # kill point, until it has SIGKILLed itself there).
+            if kill_point == AFTER_TOOL_STEP_IMMEDIATE:
+                first.wait(SPAWN_TIMEOUT_S)
+            elif kill_point == AFTER_COMMIT:
+                _wait(
+                    lambda: service.barrier_state(sim, ids["namespace"], BARRIER)["reached"],
+                    "the simulator to hold the committed charge",
+                    first,
+                )
+            else:
+                row = _wait(
+                    lambda: rt.execute(
+                        "SELECT worker_pid FROM crash_points WHERE run_id = %s AND name = %s",
+                        (ids["run"], kill_point),
+                    ).fetchone(),
+                    f"the worker to reach {kill_point}",
+                    first,
+                )
+                obs["crash_point_pid_is_child"] = row["worker_pid"] == first.pid
+
+            # 2. What is durable at the moment of the kill.
+            obs["at_kill"] = {
+                "checkpoint": _checkpoint(probe, rt, ids["thread"]),
+                "call_log": _call_log(sim, ids["namespace"]),
+                "ledger_effects": _effects(ledger, ids["namespace"]),
+                "tool_events": _tool_events(rt, ids["run"]),
+                "model_turns": _model_turns(rt, ids["run"]),
+            }
+
+            # 3. SIGKILL, never an exception.
+            if kill_point != AFTER_TOOL_STEP_IMMEDIATE:
+                os.kill(first.pid, signal.SIGKILL)
+                first.wait(10)
+            obs["killed_returncode"] = first.returncode
+            if kill_point == AFTER_COMMIT:
+                service.release_barrier(sim, ids["namespace"], BARRIER)
+                _wait(
+                    lambda: all(
+                        c["outcome"] != service.IN_FLIGHT for c in _call_log(sim, ids["namespace"])
+                    ),
+                    "the abandoned charge to finish after the release",
+                )
+            obs["after_kill"] = {
+                "checkpoint": _checkpoint(probe, rt, ids["thread"]),
+                "call_log": _call_log(sim, ids["namespace"]),
+            }
+
+            # 4. Resume in a fresh process: same thread and run, no hooks, messages=None.
+            resumed = lab.spawn(ids, hook="none", durability="sync", resume=True)
+            out, err = resumed.communicate(timeout=SPAWN_TIMEOUT_S)
+            obs["resume_returncode"] = resumed.returncode
+            lines = out.strip().splitlines()
+            assert lines, f"the resumed worker printed nothing (exit {resumed.returncode}):\n{err}"
+            result = json.loads(lines[-1])
+            if result["ok"]:
+                state = result["state"]
+                obs["resume"] = {
+                    "ok": True,
+                    "done": state["done"],
+                    "claimed_outcome": state["claimed_outcome"],
+                    "ended_by": state["ended_by"],
+                    "turn": state["turn"],
+                    "charge_results": _charge_results(state["messages"]),
+                }
+            else:
+                obs["resume"] = {"ok": False, "error": result["error"]}
+
+            # 5. The record after the resume.
+            obs["final"] = {
+                "call_log": _call_log(sim, ids["namespace"]),
+                "ledger_effects": _effects(ledger, ids["namespace"]),
+                "tool_events": _tool_events(rt, ids["run"]),
+                "model_turns": _model_turns(rt, ids["run"]),
+            }
+            final = obs["final"]
+            obs["charge_requests_unrecorded_by_tool_events"] = len(final["call_log"]) - sum(
+                1 for e in final["tool_events"] if e["tool"] == "charge"
+            )
+        finally:
+            _reap(first)
+            _reap(resumed)
+            service.release_barrier(sim, ids["namespace"], BARRIER)
+            saver.delete_thread(ids["thread"])
+            rt.execute("DELETE FROM experiments WHERE id = %s", (ids["experiment"],))
+    if EVIDENCE:
+        with _evidence_lock, open(EVIDENCE, "a") as fh:
+            fh.write(json.dumps(obs, sort_keys=True) + "\n")
+    return obs
+
+
+def run_reps(lab: Lab, kill_point: str, reps: int, durability: str = "sync"):
+    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+        return list(pool.map(lambda rep: run_replay(lab, kill_point, rep, durability), range(reps)))
+
+
+def first_charge_answered_fresh() -> dict[str, Any]:
+    return {"http_status": 200, "replayed": False}
+
+
+def charge_answered_as_replay() -> dict[str, Any]:
+    return {"http_status": 200, "replayed": True}
+
+
+# The measurements. Each asserts every repetition, with the whole observation on failure.
+
+
+def test_killed_before_send_the_resume_sends_the_charge_for_the_first_time(lab):
+    for obs in run_reps(lab, BEFORE_SEND, REPS):
+        at_kill, after, final, resume = (
+            obs["at_kill"],
+            obs["after_kill"],
+            obs["final"],
+            obs["resume"],
+        )
+        assert obs["crash_point_pid_is_child"], obs
+        assert obs["killed_returncode"] == -signal.SIGKILL, obs
+        # At the kill: the model step is checkpointed, the tool step has not run, nothing sent.
+        assert at_kill["checkpoint"]["exists"] and at_kill["checkpoint"]["next"] == ["tool"], obs
+        assert at_kill["checkpoint"]["charge_results"] == [], obs
+        assert at_kill["call_log"] == [] and at_kill["ledger_effects"] == 0, obs
+        assert at_kill["tool_events"] == [] and at_kill["model_turns"] == [0], obs
+        assert after["checkpoint"] == at_kill["checkpoint"], obs
+        # The resume runs the tool node from its start; this is the first request.
+        assert resume["ok"] and resume["done"], obs
+        assert (resume["claimed_outcome"], resume["ended_by"]) == ("succeeded", "report_done")
+        assert resume["charge_results"] == [first_charge_answered_fresh()], obs
+        assert [(c["call_index"], c["outcome"]) for c in final["call_log"]] == [(1, "committed")]
+        assert final["ledger_effects"] == 1, obs
+        assert [(e["turn"], e["tool"]) for e in final["tool_events"]] == [
+            (0, "charge"),
+            (1, "report_done"),
+        ], obs
+        assert final["model_turns"] == [0, 1], obs
+        assert obs["charge_requests_unrecorded_by_tool_events"] == 0, obs
+
+
+def test_killed_after_commit_before_checkpoint_the_charge_is_replayed_and_absorbed(lab):
+    for obs in run_reps(lab, AFTER_COMMIT, REPS):
+        at_kill, after, final, resume = (
+            obs["at_kill"],
+            obs["after_kill"],
+            obs["final"],
+            obs["resume"],
+        )
+        assert obs["killed_returncode"] == -signal.SIGKILL, obs
+        # At the kill: the charge has committed (one effect, its call in flight), but the
+        # graph's latest checkpoint is still the model step's, with no tool result in it.
+        assert at_kill["ledger_effects"] == 1, obs
+        assert [(c["call_index"], c["outcome"]) for c in at_kill["call_log"]] == [
+            (1, service.IN_FLIGHT)
+        ], obs
+        assert at_kill["checkpoint"]["exists"] and at_kill["checkpoint"]["next"] == ["tool"], obs
+        assert at_kill["checkpoint"]["charge_results"] == [], obs
+        assert at_kill["tool_events"] == [] and at_kill["model_turns"] == [0], obs
+        # Released, the abandoned request finishes as a fresh commit nobody receives.
+        assert [(c["call_index"], c["outcome"], c["replayed"]) for c in after["call_log"]] == [
+            (1, "committed", False)
+        ], obs
+        assert after["checkpoint"] == at_kill["checkpoint"], obs
+        # The resume re-executes the tool node: the same charge goes out a second time and
+        # the simulator answers it from the idempotency record. One effect, not two.
+        assert resume["ok"] and resume["done"], obs
+        assert (resume["claimed_outcome"], resume["ended_by"]) == ("succeeded", "report_done")
+        assert [(c["call_index"], c["outcome"], c["replayed"]) for c in final["call_log"]] == [
+            (1, "committed", False),
+            (2, "replayed", True),
+        ], obs
+        assert final["ledger_effects"] == 1, obs
+        # The graph holds one charge result, the replay's. The first attempt left nothing in
+        # it; only the simulator's "replayed" answer says there was one.
+        assert resume["charge_results"] == [charge_answered_as_replay()], obs
+        assert [(e["turn"], e["tool"]) for e in final["tool_events"]] == [
+            (0, "charge"),
+            (1, "report_done"),
+        ], obs
+        assert final["tool_events"][0]["replayed"] is True, obs
+        assert final["model_turns"] == [0, 1], obs
+        # The killed attempt's request is in the simulator's call log and nowhere in the
+        # runtime's record: tool_events alone would say one request was made.
+        assert obs["charge_requests_unrecorded_by_tool_events"] == 1, obs
+
+
+def test_killed_after_checkpoint_the_tool_node_does_not_run_again(lab):
+    for obs in run_reps(lab, AFTER_CHECKPOINT, REPS):
+        at_kill, after, final, resume = (
+            obs["at_kill"],
+            obs["after_kill"],
+            obs["final"],
+            obs["resume"],
+        )
+        assert obs["crash_point_pid_is_child"], obs
+        assert obs["killed_returncode"] == -signal.SIGKILL, obs
+        # Evidence that the kill is after the checkpoint: the thread's latest checkpoint
+        # already holds the charge's result and waits at the model node.
+        assert at_kill["checkpoint"]["exists"] and at_kill["checkpoint"]["next"] == ["model"]
+        assert at_kill["checkpoint"]["charge_results"] == [first_charge_answered_fresh()], obs
+        assert [(c["call_index"], c["outcome"]) for c in at_kill["call_log"]] == [
+            (1, "committed")
+        ], obs
+        assert at_kill["ledger_effects"] == 1 and at_kill["model_turns"] == [0], obs
+        assert [e["tool"] for e in at_kill["tool_events"]] == ["charge"], obs
+        assert after["checkpoint"] == at_kill["checkpoint"], obs
+        # The resume starts at the model node: no second request, no second tool event.
+        assert resume["ok"] and resume["done"], obs
+        assert (resume["claimed_outcome"], resume["ended_by"]) == ("succeeded", "report_done")
+        assert resume["charge_results"] == [first_charge_answered_fresh()], obs
+        assert [(c["call_index"], c["outcome"]) for c in final["call_log"]] == [(1, "committed")]
+        assert final["ledger_effects"] == 1, obs
+        assert [(e["turn"], e["tool"]) for e in final["tool_events"]] == [
+            (0, "charge"),
+            (1, "report_done"),
+        ], obs
+        assert final["model_turns"] == [0, 1], obs
+        assert obs["charge_requests_unrecorded_by_tool_events"] == 0, obs
+
+
+# The durability contrast: the same after_checkpoint kill with the first process running
+# under a weaker durability. The resume always runs with "sync".
+
+
+def test_under_exit_durability_a_kill_after_the_tool_step_leaves_nothing_to_resume(lab):
+    for obs in run_reps(lab, AFTER_CHECKPOINT, CONTRAST_REPS, durability="exit"):
+        at_kill, final, resume = obs["at_kill"], obs["final"], obs["resume"]
+        assert obs["killed_returncode"] == -signal.SIGKILL, obs
+        # The charge committed and was recorded, but "exit" writes no checkpoint before the
+        # graph exits, and a SIGKILL is not an exit.
+        assert at_kill["checkpoint"] == {
+            "exists": False,
+            "rows": 0,
+            "next": None,
+            "charge_results": None,
+        }, obs
+        assert at_kill["ledger_effects"] == 1, obs
+        assert [e["tool"] for e in at_kill["tool_events"]] == ["charge"], obs
+        assert resume == {
+            "ok": False,
+            "error": f"cannot resume thread {obs['ids']['thread']!r}: it has no checkpoint",
+        }, obs
+        assert obs["resume_returncode"] == 3, obs
+        assert [(c["call_index"], c["outcome"]) for c in final["call_log"]] == [(1, "committed")]
+        assert final["ledger_effects"] == 1, obs
+
+
+# Both helpers judge a run by the checkpoint read after the kill, which is the state the
+# resume starts from. Under "async" the read taken while the child is parked can race the
+# background write and see it half landed (measured once in 20 runs: the tool result
+# present but no next node), so it is recorded as evidence and not asserted on there.
+
+
+def _resumed_without_re_execution(obs: dict[str, Any]) -> None:
+    checkpoint, final, resume = obs["after_kill"]["checkpoint"], obs["final"], obs["resume"]
+    assert checkpoint["next"] == ["model"], obs
+    assert checkpoint["charge_results"] == [first_charge_answered_fresh()], obs
+    assert resume["ok"] and resume["charge_results"] == [first_charge_answered_fresh()], obs
+    assert [(c["call_index"], c["outcome"]) for c in final["call_log"]] == [(1, "committed")]
+    assert [(e["turn"], e["tool"]) for e in final["tool_events"]] == [
+        (0, "charge"),
+        (1, "report_done"),
+    ], obs
+
+
+def _resumed_by_re_executing_the_charge(obs: dict[str, Any]) -> None:
+    checkpoint, final, resume = obs["after_kill"]["checkpoint"], obs["final"], obs["resume"]
+    # The tool step ran to its end in the killed process (its event row is there) but its
+    # checkpoint never reached the database, so the thread still waits at the tool node.
+    assert checkpoint["next"] == ["tool"], obs
+    assert checkpoint["charge_results"] == [], obs
+    assert [e["tool"] for e in obs["at_kill"]["tool_events"]] == ["charge"], obs
+    # The resume runs the tool node again: a second request, answered as a replay.
+    assert resume["ok"] and resume["charge_results"] == [charge_answered_as_replay()], obs
+    assert [(c["call_index"], c["outcome"]) for c in final["call_log"]] == [
+        (1, "committed"),
+        (2, "replayed"),
+    ], obs
+    assert [(e["turn"], e["tool"], e.get("replayed")) for e in final["tool_events"]] == [
+        (0, "charge", False),
+        (0, "charge", True),
+        (1, "report_done", None),
+    ], obs
+
+
+def _resumed_consistently_with_its_checkpoint(obs: dict[str, Any]) -> None:
+    assert obs["killed_returncode"] == -signal.SIGKILL, obs
+    if obs["after_kill"]["checkpoint"]["next"] == ["tool"]:
+        _resumed_by_re_executing_the_charge(obs)
+    else:
+        _resumed_without_re_execution(obs)
+    assert obs["final"]["ledger_effects"] == 1, obs
+
+
+def test_under_async_durability_a_kill_after_the_tool_step_resumes_from_what_landed(lab):
+    """Measured, every run's tool-step checkpoint had landed by the time the orchestrator's
+    kill arrived, so the resume did not re-run the tool node (20 of 20). That is a race won
+    by the pause before the kill, not a guarantee, so each run is checked for consistency
+    with what its checkpoint held rather than pinned to one side of the race."""
+    for obs in run_reps(lab, AFTER_CHECKPOINT, CONTRAST_REPS, durability="async"):
+        _resumed_consistently_with_its_checkpoint(obs)
+
+
+# The decisive contrast. The worker SIGKILLs itself the instant its second model call starts,
+# so there is no pause in which a background checkpoint write could land.
+
+
+def test_an_immediate_kill_after_the_tool_step_under_sync_never_re_executes_it(lab):
+    for obs in run_reps(lab, AFTER_TOOL_STEP_IMMEDIATE, CONTRAST_REPS, durability="sync"):
+        assert obs["killed_returncode"] == -signal.SIGKILL, obs
+        _resumed_without_re_execution(obs)
+        assert obs["final"]["ledger_effects"] == 1, obs
+
+
+def test_an_immediate_kill_after_the_tool_step_under_async_loses_the_step(lab):
+    """Under "async" the tool step's checkpoint is written in the background while the next
+    step starts, so whether a kill at that instant loses it is a race. Measured, the loss
+    was every time (docs/replay-findings.md). Each run is checked for consistency with what
+    its checkpoint held, and at least one run must show the loss, so a LangGraph change that
+    makes "async" flush before the next step fails here."""
+    observed = run_reps(lab, AFTER_TOOL_STEP_IMMEDIATE, CONTRAST_REPS, durability="async")
+    for obs in observed:
+        _resumed_consistently_with_its_checkpoint(obs)
+    lost = [obs for obs in observed if obs["after_kill"]["checkpoint"]["next"] == ["tool"]]
+    assert lost, observed
