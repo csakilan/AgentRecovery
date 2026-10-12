@@ -7,7 +7,8 @@ from LangGraph's documentation, which does not describe this case (D11).
 ## The answer
 
 A tool node whose process dies after the charge has committed, but before the graph has
-checkpointed the node's result, is run again from its start when the thread is resumed.
+saved anything of the node's result, is run again from its start when the thread is
+resumed.
 The same charge request reaches the payment backend a second time. Because it carries the
 same idempotency key, the backend answers it from its idempotency record
 (`replayed: true`) and the ledger still holds **one effect, not two**. The resumed graph
@@ -87,8 +88,9 @@ LAB_REPLAY_EVIDENCE=<file> uv run pytest tests/agent/test_replay.py -q
 
 Run 1 measured everything below, and one of its seven tests failed on an assertion of
 mine, not on the behaviour under test: the `"async"` test at K3 asserted on the checkpoint
-read taken while the child was parked, and in one run of 20 that read caught the background
-write half landed (described under the contrast). The test was changed to judge each run by
+read taken while the child was parked, and in one run of 20 that read caught the tool
+task's pending writes saved and the step checkpoint not yet saved (described under the
+contrast). The test was changed to judge each run by
 the checkpoint read after the kill, which is the state the resume starts from, and run 2
 used the final tests: `7 passed`. Run 2's observations had the same shapes as run 1's, case
 by case, except that the half-landed read did not recur. Run 2 overlapped a period of heavy
@@ -124,7 +126,8 @@ the model step's checkpoint and ran the tool node again from its start, which se
 charge for the first time. One request, one effect.
 
 At **K2** the charge had committed in the backend, and the child died while waiting for the
-response. The graph's latest checkpoint was still the model step's, so the resume ran the
+response. The tool node had not finished, so nothing of it was saved: the latest checkpoint
+was still the model step's and the tool task had no pending writes. The resume ran the
 tool node again from its start and sent the identical request: the arguments come from the
 checkpointed assistant message, so the replay necessarily carries the same idempotency key
 `k1`. The simulator answered it from the idempotency record. The first request's response
@@ -136,13 +139,57 @@ simulator's `call_log` shows two: the runtime's own record of tool calls misses 
 request that matters, which is why the cross-check is needed.
 
 At **K3** the tool step's checkpoint, holding the charge's result, was written before the
-child died (confirmed by reading it before each kill). The resume began at the model node.
+child died (confirmed by reading it before each kill, and classified as
+`step_checkpointed` in the evidence). The resume began at the model node.
 The tool node did not run again and no second request was sent.
 
-Under `"sync"`, then, a node is re-executed exactly when its process died before the
-node's checkpoint was written, regardless of what the node had already done to the outside
-world. A replayed tool call produced no second effect in any run, and the reason is the
-backend's idempotency on a stable key, not anything in the graph.
+Under `"sync"`, then, a tool node that died before finishing was re-executed from its
+start, regardless of what it had already done to the outside world, and a tool node whose
+step was saved was not. A replayed tool call produced no second effect in any run, and the
+reason is the backend's idempotency on a stable key, not anything in the graph.
+
+## Where exactly the boundary is
+
+The boundary is the tool task's saved writes, not only the step checkpoint. LangGraph saves
+two things for a step: each task's pending writes, saved as the task finishes
+(`put_writes`, called from `langgraph/pregel/_loop.py:481` unless durability is `"exit"`),
+and the step checkpoint, saved after the step (`put`). On resume, a task whose writes are
+saved is handed those writes instead of being run again
+(`_reapply_writes_to_succeeded_nodes`, `langgraph/pregel/_loop.py:772-783`, called at
+`:678`). `get_state` applies the same pending writes to the values it returns and leaves a
+task with writes out of `next` (`_prepare_state_snapshot`,
+`langgraph/pregel/main.py:1307-1325`; line numbers are for langgraph 1.2.14 as installed).
+So a tool node is re-executed exactly when its
+process died before its task's writes were saved. A saved step checkpoint is sufficient
+but not necessary.
+
+What is measured and what is read from source, separately:
+
+- **Measured with SIGKILL.** Under `"sync"`, K1 and K2 (tool node unfinished, so neither
+  writes nor checkpoint saved) re-ran the node; K3 (both saved) did not. These runs cannot
+  tell the two boundaries apart, because under `"sync"` the writes and the checkpoint are
+  both saved before the next step starts.
+- **Measured with SIGKILL, under `"async"`.** The immediate kill left neither saved and the
+  node re-ran (40 of 40). One parked read in run 1 caught the in-between state: the
+  charge result present and `next=()`, which is the tool task's writes applied on top of
+  the model step's checkpoint. By the time of the kill the step checkpoint had landed too,
+  so that run's resume does not test the in-between state. It shows only that the state
+  exists and that a reader can see it.
+- **Measured in-process, by construction.**
+  `test_pending_writes_alone_keep_a_finished_tool_step_from_running_again` uses a saver that
+  drops every checkpoint after the model step, so the tool task's writes are the only
+  record of the tool step. A fresh graph reads the model step's checkpoint (step 1), with
+  `next=()` and the tool task's writes applied, and its resume does not call the executor.
+  The process is stopped by an exception there, not a SIGKILL. That does not matter for
+  this question, since what is being tested is what a fresh graph does with the saved
+  state.
+- **From reading the source.** The two functions cited above are why the in-between state
+  resumes without re-execution. That explanation is not measured; the behaviour it explains
+  is.
+
+For a journal outside the graph (Plan 4) this means the dangerous window for a tool call is
+from the moment its request can reach the backend until its task's writes are saved, not
+until the step checkpoint is saved.
 
 ## Durability contrast (secondary)
 
@@ -155,7 +202,7 @@ second model call):
 | First-process durability | Runs | Checkpoint at kill | Resume | Charge re-executed | Ledger |
 |---|---|---|---|---|---|
 | `"exit"` | 40 / 40 | **none** (0 `checkpoints` rows) | **refused**: `cannot resume thread ...: it has no checkpoint` | n/a, nothing to resume | 1 effect |
-| `"async"` | 40 / 40 | tool step, holds the charge result (read after the kill; see below) | ran from the model node | no | 1 effect |
+| `"async"` | 40 / 40 | tool step, holds the charge result (read after the kill; one read before it caught writes without checkpoint, see below) | ran from the model node | no | 1 effect |
 
 Under `"exit"` nothing is written until the graph exits, and a SIGKILL is not an exit, so
 there is no checkpoint at all, although the recorder's rows (`model_calls` turn 0, the
@@ -164,12 +211,15 @@ episode over, which would ask the model again with no memory of the charge. (Tha
 was not measured here.)
 
 Under `"async"` at K3 the resume matched `"sync"` in all 40 runs, but that does not show
-`"async"` is safe. One read shows why: in one run, the checkpoint read taken while the child
-was parked at the hook already showed the charge result but no next node (`next=()`), and
-the read taken just after the kill showed `next=("model",)`. The background write was still
-landing when the child had already started its next step. What saved the other runs is
-the pause before the orchestrator's kill: it lands some milliseconds after the hook parks,
-which is time enough for the background write to finish. So a supplementary kill point was
+`"async"` is safe. One read shows why. In one run, the checkpoint read taken while the
+child was parked at the hook showed the charge result but no next node (`next=()`): the
+tool task's pending writes had been saved and the step checkpoint had not yet. The read
+taken just after the kill showed the step checkpoint saved (`next=("model",)`). (That
+parked read also counted 4 `checkpoints` rows, because the row count is a separate query
+taken a moment after `get_state`, by which time the checkpoint had landed.) The child had
+already started its next step while its saves were still landing. What saved the other
+runs is the pause before the orchestrator's kill: it lands some milliseconds after the
+hook parks, which is time enough for the background saves to finish. So a supplementary kill point was
 measured, **after_tool_step_immediate**, where the child SIGKILLs itself the instant its
 second model call starts, with no row written and no pause. It is not one of the brief's
 three kill points, and it is labelled as supplementary in the tests too.
@@ -177,11 +227,12 @@ three kill points, and it is labelled as supplementary in the tests too.
 | First-process durability | Runs | Checkpoint at kill | Tool node on resume | Charge requests | Ledger |
 |---|---|---|---|---|---|
 | `"sync"` | 40 / 40 | tool step, holds the charge result | not re-run | 1 (`committed`) | 1 effect |
-| `"async"` | 40 / 40 | **model step only** (`next=("tool",)`) | **re-run** | **2**: `committed`, then `replayed` | 1 effect |
+| `"async"` | 40 / 40 | **model step only, no tool writes** (`next=("tool",)`) | **re-run** | **2**: `committed`, then `replayed` | 1 effect |
 
 Under `"async"` the tool step had run to its end in the killed process (its `tool_events`
-row is there, with `replayed: false`), but its checkpoint never reached the database, so
-the resume re-ran the tool node and sent the charge again; `tool_events` then holds two
+row is there, with `replayed: false`), but neither the tool task's writes nor the step
+checkpoint reached the database, so the resume re-ran the tool node and sent the charge
+again; `tool_events` then holds two
 charge rows for turn 0. Under `"sync"` the same kill never lost the step. This is the
 direct evidence that the durability setting changes crash behaviour, which D11's fairness
 rule (every mode runs with `"sync"`) depends on: with LangGraph's default, `"async"`, a
@@ -200,12 +251,40 @@ completed tool step can be lost and replayed even after it finished.
   batch and that each run is consistent with what its checkpoint held.
 - `hold_after_commit` holds the response inside the simulator, so K2's kill is while the
   child waits for a response. A kill after the response arrives and before the
-  `tool_events` row is written was not measured. By inference, not measurement, the
-  checkpoint would be the same as at K2 (the tool node had not finished), and the first
-  response would be in neither the graph nor the runtime's record.
+  `tool_events` row is written was not measured. By inference, not measurement, nothing of
+  the tool step would be saved, as at K2 (the tool node had not finished, so it has no
+  writes and no checkpoint), and the first response would be in neither the graph nor the
+  runtime's record.
 
-## Where it is pinned
+## What the tests pin and what is only recorded
 
-`tests/agent/test_replay.py` asserts all of the above, run by run, so an upgrade of
-LangGraph or of the Postgres checkpointer that changes any of it fails the suite.
-`tests/agent/replay_worker.py` is the child process and holds the kill-point hooks.
+`tests/agent/test_replay.py` asserts on every run it makes, and `tests/agent/replay_worker.py`
+is the child process with the kill-point hooks. Not every row above is pinned, though.
+
+Pinned by assertions, run by run, so a change in LangGraph or the Postgres checkpointer
+fails the suite:
+
+- every cell of the primary table (K1, K2, K3 under `"sync"`);
+- the `"exit"` row: no checkpoint, the resume refused, one effect;
+- the immediate kill under `"sync"`: the step checkpoint saved, no re-execution;
+- the in-process construction: tool task writes alone, `next=()`, no re-execution.
+
+Recorded measurements only, not pinned:
+
+- The `"async"` row at K3 ("tool step, not re-run", 40 of 40). The test accepts any of the
+  three states (step checkpointed, writes only, neither saved) and checks only that each
+  run's resume is consistent with the state it found, because which state a run lands in
+  is a race.
+- The immediate kill under `"async"` ("neither saved, re-run", 40 of 40). The test checks
+  each run for consistency in the same way and requires at least one run per batch to show
+  the loss, so a LangGraph change that makes `"async"` save before the next step starts
+  fails. It does not require every run to lose the step, and on a faster host a batch
+  could in principle show none and fail; that has not been observed.
+
+Since this document's first version, the evidence for each run also records which of the
+three states its checkpoint reads were in (`boundary`: `tool_step_not_saved`,
+`step_checkpointed`, `pending_writes_only`), plus the step read and the tasks with pending
+writes. The two 20-repetition runs behind the tables predate that field. Two later runs at
+the suite defaults (17 runs each) classified every read as expected: K1, K2 and the
+immediate `"async"` kill as `tool_step_not_saved`; K3 under both durabilities and the
+immediate `"sync"` kill as `step_checkpointed`.

@@ -64,15 +64,23 @@ from typing import Any
 import psycopg
 import pytest
 import uvicorn
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from lab.agent.graph import build_graph
+from lab.agent.executor import (
+    RULE_AGENT_DIRECTED,
+    ToolOutcome,
+    render_observation,
+    requested_key_of,
+)
+from lab.agent.graph import build_graph, run_episode
+from lab.agent.prompts import system_prompt, user_prompt
 from lab.agent.scripted import ScriptedModel
 from lab.agent.tools import tool_schemas
 from lab.protocol.faults import FaultPlan
-from lab.protocol.task import Profile
+from lab.protocol.task import DEFAULT_TASK, Profile
 from lab.simulator import service
 from lab.simulator.app import create_public_app
 
@@ -87,6 +95,10 @@ TOKEN = "client-replay"
 POLICY = "false_success"
 BARRIER = "after_commit:1"
 TOOLS = tool_schemas(Profile.CONTROLLED, status_available=True)
+START = [
+    {"role": "system", "content": system_prompt("neutral")},
+    {"role": "user", "content": user_prompt(DEFAULT_TASK, Profile.CONTROLLED)},
+]
 
 BEFORE_SEND = "before_send"
 AFTER_COMMIT = "after_commit_before_checkpoint"
@@ -259,12 +271,43 @@ def _checkpoint(probe, saver_conn, thread: str) -> dict[str, Any]:
     ).fetchone()["n"]
     if snapshot.created_at is None:
         return {"exists": False, "rows": rows, "next": None, "charge_results": None}
-    return {
+    checkpoint = {
         "exists": True,
         "rows": rows,
         "next": list(snapshot.next),
         "charge_results": _charge_results(snapshot.values["messages"]),
+        # The step of the checkpoint get_state read, and the tasks whose pending writes it
+        # applied. Read in the same call as `next`; `rows` is a separate, later query.
+        "step": snapshot.metadata.get("step"),
+        "tasks_with_writes": sorted(t.name for t in snapshot.tasks if t.result is not None),
     }
+    checkpoint["boundary"] = _boundary(checkpoint)
+    return checkpoint
+
+
+# Where a thread stands after the tool step, as a resume sees it. LangGraph keeps two things
+# per step: the task's pending writes (`put_writes`, saved as each task finishes) and the
+# step checkpoint (`put`, saved after the step). `get_state` applies pending writes to the
+# values and leaves a task with writes out of `next` (langgraph/pregel/main.py,
+# _prepare_state_snapshot), and a resume hands a finished task its saved writes instead of
+# running it again (langgraph/pregel/_loop.py, _reapply_writes_to_succeeded_nodes).
+TOOL_STEP_NOT_SAVED = "tool_step_not_saved"  # neither writes nor checkpoint saved: re-run
+STEP_CHECKPOINTED = "step_checkpointed"  # the tool step's checkpoint landed
+PENDING_WRITES_ONLY = "pending_writes_only"  # the tool task's writes landed, the checkpoint not
+
+
+def _boundary(checkpoint: dict[str, Any]) -> str | None:
+    """Classify a checkpoint read as one of the three states above, or None if it is none
+    of them (no checkpoint, or a shape no test expects)."""
+    if not checkpoint["exists"]:
+        return None
+    shape = (tuple(checkpoint["next"]), len(checkpoint["charge_results"]))
+    shape += (tuple(checkpoint["tasks_with_writes"]),)
+    return {
+        (("tool",), 0, ()): TOOL_STEP_NOT_SAVED,
+        (("model",), 1, ()): STEP_CHECKPOINTED,
+        ((), 1, ("tool",)): PENDING_WRITES_ONLY,
+    }.get(shape)
 
 
 def _call_log(sim, namespace: str) -> list[dict[str, Any]]:
@@ -622,15 +665,17 @@ def test_under_exit_durability_a_kill_after_the_tool_step_leaves_nothing_to_resu
         assert final["ledger_effects"] == 1, obs
 
 
-# Both helpers judge a run by the checkpoint read after the kill, which is the state the
+# The helpers judge a run by the checkpoint read after the kill, which is the state the
 # resume starts from. Under "async" the read taken while the child is parked can race the
-# background write and see it half landed (measured once in 20 runs: the tool result
-# present but no next node), so it is recorded as evidence and not asserted on there.
+# background writes (once in 40 runs it caught the tool task's writes landed and the step
+# checkpoint not yet), so that read is recorded as evidence and not asserted on there.
 
 
 def _resumed_without_re_execution(obs: dict[str, Any]) -> None:
+    """The tool step survived the kill, as its checkpoint or as its task's pending writes
+    alone. Either way the resume must not run the tool node again."""
     checkpoint, final, resume = obs["after_kill"]["checkpoint"], obs["final"], obs["resume"]
-    assert checkpoint["next"] == ["model"], obs
+    assert checkpoint["boundary"] in (STEP_CHECKPOINTED, PENDING_WRITES_ONLY), obs
     assert checkpoint["charge_results"] == [first_charge_answered_fresh()], obs
     assert resume["ok"] and resume["charge_results"] == [first_charge_answered_fresh()], obs
     assert [(c["call_index"], c["outcome"]) for c in final["call_log"]] == [(1, "committed")]
@@ -642,10 +687,10 @@ def _resumed_without_re_execution(obs: dict[str, Any]) -> None:
 
 def _resumed_by_re_executing_the_charge(obs: dict[str, Any]) -> None:
     checkpoint, final, resume = obs["after_kill"]["checkpoint"], obs["final"], obs["resume"]
-    # The tool step ran to its end in the killed process (its event row is there) but its
-    # checkpoint never reached the database, so the thread still waits at the tool node.
-    assert checkpoint["next"] == ["tool"], obs
-    assert checkpoint["charge_results"] == [], obs
+    # The tool step ran to its end in the killed process (its event row is there) but
+    # neither its task's writes nor its checkpoint reached the database, so the thread
+    # still waits at the tool node.
+    assert checkpoint["boundary"] == TOOL_STEP_NOT_SAVED, obs
     assert [e["tool"] for e in obs["at_kill"]["tool_events"]] == ["charge"], obs
     # The resume runs the tool node again: a second request, answered as a replay.
     assert resume["ok"] and resume["charge_results"] == [charge_answered_as_replay()], obs
@@ -662,7 +707,7 @@ def _resumed_by_re_executing_the_charge(obs: dict[str, Any]) -> None:
 
 def _resumed_consistently_with_its_checkpoint(obs: dict[str, Any]) -> None:
     assert obs["killed_returncode"] == -signal.SIGKILL, obs
-    if obs["after_kill"]["checkpoint"]["next"] == ["tool"]:
+    if obs["after_kill"]["checkpoint"]["boundary"] == TOOL_STEP_NOT_SAVED:
         _resumed_by_re_executing_the_charge(obs)
     else:
         _resumed_without_re_execution(obs)
@@ -671,9 +716,10 @@ def _resumed_consistently_with_its_checkpoint(obs: dict[str, Any]) -> None:
 
 def test_under_async_durability_a_kill_after_the_tool_step_resumes_from_what_landed(lab):
     """Measured, every run's tool-step checkpoint had landed by the time the orchestrator's
-    kill arrived, so the resume did not re-run the tool node (20 of 20). That is a race won
-    by the pause before the kill, not a guarantee, so each run is checked for consistency
-    with what its checkpoint held rather than pinned to one side of the race."""
+    kill arrived, so the resume did not re-run the tool node (40 of 40). That is a race won
+    by the pause before the kill, not a guarantee, so this test accepts any of the three
+    states and checks only that each run's resume is consistent with the state it found.
+    The 40 of 40 is a recorded measurement, not something this test pins."""
     for obs in run_reps(lab, AFTER_CHECKPOINT, CONTRAST_REPS, durability="async"):
         _resumed_consistently_with_its_checkpoint(obs)
 
@@ -685,6 +731,8 @@ def test_under_async_durability_a_kill_after_the_tool_step_resumes_from_what_lan
 def test_an_immediate_kill_after_the_tool_step_under_sync_never_re_executes_it(lab):
     for obs in run_reps(lab, AFTER_TOOL_STEP_IMMEDIATE, CONTRAST_REPS, durability="sync"):
         assert obs["killed_returncode"] == -signal.SIGKILL, obs
+        # "sync" writes the step checkpoint before the next step starts, so it is there.
+        assert obs["after_kill"]["checkpoint"]["boundary"] == STEP_CHECKPOINTED, obs
         _resumed_without_re_execution(obs)
         assert obs["final"]["ledger_effects"] == 1, obs
 
@@ -692,11 +740,119 @@ def test_an_immediate_kill_after_the_tool_step_under_sync_never_re_executes_it(l
 def test_an_immediate_kill_after_the_tool_step_under_async_loses_the_step(lab):
     """Under "async" the tool step's checkpoint is written in the background while the next
     step starts, so whether a kill at that instant loses it is a race. Measured, the loss
-    was every time (docs/replay-findings.md). Each run is checked for consistency with what
-    its checkpoint held, and at least one run must show the loss, so a LangGraph change that
-    makes "async" flush before the next step fails here."""
+    was every time (40 of 40, docs/replay-findings.md). This test pins less than that: each
+    run is checked for consistency with the state it found, and at least one run per batch
+    must show the loss, so a LangGraph change that makes "async" save the step before the
+    next one starts fails here."""
     observed = run_reps(lab, AFTER_TOOL_STEP_IMMEDIATE, CONTRAST_REPS, durability="async")
     for obs in observed:
         _resumed_consistently_with_its_checkpoint(obs)
-    lost = [obs for obs in observed if obs["after_kill"]["checkpoint"]["next"] == ["tool"]]
+    lost = [o for o in observed if o["after_kill"]["checkpoint"]["boundary"] == TOOL_STEP_NOT_SAVED]
     assert lost, observed
+
+
+# The third state, constructed in-process. A saver that drops every checkpoint after the
+# model step leaves the tool task's pending writes as the only record of the tool step.
+# This checks the classification above and the resume behaviour it relies on, without
+# needing a SIGKILL to land in the window between `put_writes` and `put`.
+
+
+class _DropCheckpointsAfterModelStep(InMemorySaver):
+    def put(self, config, checkpoint, metadata, new_versions):
+        if metadata.get("step", -1) <= 1:
+            return super().put(config, checkpoint, metadata, new_versions)
+        conf = config["configurable"]
+        return {
+            "configurable": {
+                "thread_id": conf["thread_id"],
+                "checkpoint_ns": conf.get("checkpoint_ns", ""),
+                "checkpoint_id": checkpoint["id"],
+            }
+        }
+
+
+class _CountingExecutor:
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self, call):
+        self.calls += 1
+        body = {"message": "Charge succeeded.", "replayed": False, "charge": {}}
+        return ToolOutcome(
+            requested_args=dict(call.arguments),
+            requested_key=requested_key_of(call.arguments),
+            effective_args=dict(call.arguments),
+            effective_key=requested_key_of(call.arguments),
+            rule=RULE_AGENT_DIRECTED,
+            observation=render_observation(RULE_AGENT_DIRECTED, http_status=200, body=body),
+            http_status=200,
+        )
+
+
+class _MemoryRecorder:
+    def __init__(self):
+        self.tool_events = []
+
+    def record_model_call(self, **kwargs):
+        pass
+
+    def record_tool_event(self, **kwargs):
+        self.tool_events.append(kwargs["tool"])
+
+
+class _Died(Exception):
+    pass
+
+
+class _DieAtSecondCall:
+    def __init__(self, inner):
+        self._inner = inner
+        self._calls = 0
+        self.model_id = inner.model_id
+
+    def complete(self, messages, tools):
+        self._calls += 1
+        if self._calls == 2:
+            raise _Died("stands in for the process dying as the next step starts")
+        return self._inner.complete(messages, tools)
+
+
+def test_pending_writes_alone_keep_a_finished_tool_step_from_running_again():
+    saver = _DropCheckpointsAfterModelStep()
+    thread = f"t-pending-{uuid.uuid4().hex[:8]}"
+    config = {"configurable": {"thread_id": thread}}
+    first = _CountingExecutor()
+    graph = build_graph(
+        _DieAtSecondCall(ScriptedModel(POLICY)),
+        first,
+        TOOLS,
+        6,
+        recorder=_MemoryRecorder(),
+        checkpointer=saver,
+    )
+    with pytest.raises(_Died):
+        run_episode(graph, thread, START)
+    assert first.calls == 1
+
+    # Fresh graph, fresh executor, the same saver: what a new process would find.
+    again = _CountingExecutor()
+    recorder = _MemoryRecorder()
+    resumed = build_graph(
+        ScriptedModel(POLICY), again, TOOLS, 6, recorder=recorder, checkpointer=saver
+    )
+    snapshot = resumed.get_state(config)
+    assert snapshot.metadata["step"] == 1  # the model step's checkpoint is the latest
+    found = {
+        "exists": True,
+        "next": list(snapshot.next),
+        "charge_results": _charge_results(snapshot.values["messages"]),
+        "tasks_with_writes": sorted(t.name for t in snapshot.tasks if t.result is not None),
+    }
+    assert found["next"] == [] and found["tasks_with_writes"] == ["tool"]
+    assert _boundary(found) == PENDING_WRITES_ONLY
+
+    state = run_episode(resumed, thread, None)
+    assert again.calls == 0  # the tool node was handed its saved writes, not run again
+    assert recorder.tool_events == ["report_done"]
+    assert state["claimed_outcome"] == "succeeded"
+    assert _charge_results(state["messages"]) == [first_charge_answered_fresh()]
