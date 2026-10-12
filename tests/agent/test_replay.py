@@ -737,18 +737,33 @@ def test_an_immediate_kill_after_the_tool_step_under_sync_never_re_executes_it(l
         assert obs["final"]["ledger_effects"] == 1, obs
 
 
-def test_an_immediate_kill_after_the_tool_step_under_async_loses_the_step(lab):
-    """Under "async" the tool step's checkpoint is written in the background while the next
-    step starts, so whether a kill at that instant loses it is a race. Measured, the loss
-    was every time (40 of 40, docs/replay-findings.md). This test pins less than that: each
-    run is checked for consistency with the state it found, and at least one run per batch
-    must show the loss, so a LangGraph change that makes "async" save the step before the
-    next one starts fails here."""
+def test_an_immediate_kill_after_the_tool_step_under_async_resumes_from_what_landed(
+    lab, record_property
+):
+    """Under "async" the next step starts without waiting for the tool step's saves, so
+    whether a kill at that instant finds them saved is a race whose odds depend on the
+    host. Measured on one Mac, nothing was saved in 40 of 40 runs (docs/replay-findings.md).
+    That rate is recorded here, in the test output and the evidence, and not asserted: a
+    correct LangGraph may save before the kill on another host. What is pinned is that each
+    run's resume matches what landed. The property the rate depends on, that "async" does
+    not wait for the step checkpoint, is pinned deterministically by
+    test_what_the_next_step_waits_for below."""
     observed = run_reps(lab, AFTER_TOOL_STEP_IMMEDIATE, CONTRAST_REPS, durability="async")
     for obs in observed:
         _resumed_consistently_with_its_checkpoint(obs)
-    lost = [o for o in observed if o["after_kill"]["checkpoint"]["boundary"] == TOOL_STEP_NOT_SAVED]
-    assert lost, observed
+    boundaries = [o["after_kill"]["checkpoint"]["boundary"] for o in observed]
+    summary = {
+        "summary": "immediate_async_loss_rate",
+        "runs": len(boundaries),
+        "tool_step_not_saved": boundaries.count(TOOL_STEP_NOT_SAVED),
+        "pending_writes_only": boundaries.count(PENDING_WRITES_ONLY),
+        "step_checkpointed": boundaries.count(STEP_CHECKPOINTED),
+    }
+    record_property("immediate_async_loss_rate", json.dumps(summary))
+    print(f"immediate kill under async: {json.dumps(summary)}")
+    if EVIDENCE:
+        with _evidence_lock, open(EVIDENCE, "a") as fh:
+            fh.write(json.dumps(summary, sort_keys=True) + "\n")
 
 
 # The third state, constructed in-process. A saver that drops every checkpoint after the
@@ -856,3 +871,115 @@ def test_pending_writes_alone_keep_a_finished_tool_step_from_running_again():
     assert recorder.tool_events == ["report_done"]
     assert state["claimed_outcome"] == "succeeded"
     assert _charge_results(state["messages"]) == [first_charge_answered_fresh()]
+
+
+# What the next step waits for, pinned deterministically in-process. A saver holds back one
+# kind of save for the tool step until it is released: either the tool task's pending writes
+# (`put_writes`) or the tool step's checkpoint (`put`). The model notes, at the start of its
+# second call, whether the held save had completed, then releases it. A timer releases it
+# after HOLD_S in case the second call never comes first (the step waits for the save), and
+# every wait has a timeout, so a regression fails instead of hanging.
+
+HOLD_S = 1.0
+GUARD_S = 10.0
+
+
+def _is_tool_task_writes(writes) -> bool:
+    return any(
+        channel == "messages" and value and value[-1].get("role") == "tool"
+        for channel, value in writes
+    )
+
+
+class _HoldOneSave(InMemorySaver):
+    def __init__(self, hold: str):
+        super().__init__()
+        self.hold = hold  # "tool_writes" or "step_checkpoint"
+        self.release = threading.Event()
+        self.saved = threading.Event()
+        self.held_too_long = False
+
+    def _wait(self):
+        if not self.release.wait(GUARD_S):
+            self.held_too_long = True
+
+    def put_writes(self, config, writes, task_id, task_path=""):
+        is_tool = _is_tool_task_writes(writes)
+        if is_tool and self.hold == "tool_writes":
+            self._wait()
+        result = super().put_writes(config, writes, task_id, task_path)
+        if is_tool and self.hold == "tool_writes":
+            self.saved.set()
+        return result
+
+    def put(self, config, checkpoint, metadata, new_versions):
+        is_tool_step = metadata.get("step") == 2  # input -1, start 0, model 1, tool 2
+        if is_tool_step and self.hold == "step_checkpoint":
+            self._wait()
+        result = super().put(config, checkpoint, metadata, new_versions)
+        if is_tool_step and self.hold == "step_checkpoint":
+            self.saved.set()
+        return result
+
+
+class _NoteAtSecondCall:
+    def __init__(self, saver: _HoldOneSave):
+        self._inner = ScriptedModel(POLICY)
+        self.model_id = self._inner.model_id
+        self._saver = saver
+        self._calls = 0
+        self.saved_at_second_call: bool | None = None
+
+    def complete(self, messages, tools):
+        self._calls += 1
+        if self._calls == 2:
+            self.saved_at_second_call = self._saver.saved.is_set()
+            self._saver.release.set()
+        return self._inner.complete(messages, tools)
+
+
+@pytest.mark.parametrize(
+    ("hold", "durability", "saved_before_next_step"),
+    [
+        # "sync" holds the next step until the step checkpoint is saved; "async" does not.
+        ("step_checkpoint", "sync", True),
+        ("step_checkpoint", "async", False),
+        # Neither waits for the tool task's pending writes. Under "sync" the step checkpoint,
+        # which carries the same values, is what is guaranteed before the next step.
+        ("tool_writes", "sync", False),
+        ("tool_writes", "async", False),
+    ],
+)
+def test_what_the_next_step_waits_for(hold, durability, saved_before_next_step):
+    saver = _HoldOneSave(hold)
+    model = _NoteAtSecondCall(saver)
+    graph = build_graph(
+        model, _CountingExecutor(), TOOLS, 6, recorder=_MemoryRecorder(), checkpointer=saver
+    )
+    timer = threading.Timer(HOLD_S, saver.release.set)
+    timer.start()
+    outcome: dict[str, Any] = {}
+
+    def run():
+        try:
+            outcome["state"] = run_episode(
+                graph,
+                f"t-hold-{uuid.uuid4().hex[:8]}",
+                START,
+                durability=durability,
+                allow_non_sync=True,
+            )
+        except BaseException as exc:  # reported below, never swallowed
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(GUARD_S)
+    timer.cancel()
+    saver.release.set()
+    assert not worker.is_alive(), "the episode hung"
+    assert "error" not in outcome, outcome.get("error")
+    assert not saver.held_too_long
+    assert outcome["state"]["claimed_outcome"] == "succeeded"
+    assert saver.saved.wait(GUARD_S)  # the held save did complete in the end
+    assert model.saved_at_second_call is saved_before_next_step

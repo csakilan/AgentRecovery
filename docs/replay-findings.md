@@ -159,22 +159,40 @@ saved is handed those writes instead of being run again
 `:678`). `get_state` applies the same pending writes to the values it returns and leaves a
 task with writes out of `next` (`_prepare_state_snapshot`,
 `langgraph/pregel/main.py:1307-1325`; line numbers are for langgraph 1.2.14 as installed).
-So a tool node is re-executed exactly when its
-process died before its task's writes were saved. A saved step checkpoint is sufficient
-but not necessary.
+So a tool node is re-executed exactly when its process died before either of the two was
+saved: its task's writes or its step's checkpoint. Either one is enough on its own.
+
+What the next step waits for is a separate question, and it is measured deterministically
+by `test_what_the_next_step_waits_for`. An in-process saver holds back one save of the
+tool step until released, and the model notes at the start of its second call whether
+that save had completed:
+
+| Save held back | `"sync"`: saved before the next step starts? | `"async"`: saved before the next step starts? |
+|---|---|---|
+| the step checkpoint (`put`) | **yes**: the next step waited for it | no |
+| the tool task's writes (`put_writes`) | **no** | no |
+
+So `"sync"` guarantees the step checkpoint before the next step, not the task's writes.
+The checkpoint carries the same values, which is why a kill after that point never re-runs
+the node under `"sync"`. Neither durability waits for the task's writes, because
+`_checkpointer_put_after_previous` (`langgraph/pregel/_loop.py:1596-1613`) waits only for
+earlier writes to delta channels, and this graph has none. That source reading explains
+the table; the table itself is measured, and its expectations were checked to fail when
+flipped.
 
 What is measured and what is read from source, separately:
 
 - **Measured with SIGKILL.** Under `"sync"`, K1 and K2 (tool node unfinished, so neither
-  writes nor checkpoint saved) re-ran the node; K3 (both saved) did not. These runs cannot
-  tell the two boundaries apart, because under `"sync"` the writes and the checkpoint are
-  both saved before the next step starts.
-- **Measured with SIGKILL, under `"async"`.** The immediate kill left neither saved and the
-  node re-ran (40 of 40). One parked read in run 1 caught the in-between state: the
-  charge result present and `next=()`, which is the tool task's writes applied on top of
-  the model step's checkpoint. By the time of the kill the step checkpoint had landed too,
-  so that run's resume does not test the in-between state. It shows only that the state
-  exists and that a reader can see it.
+  writes nor checkpoint saved) re-ran the node; K3 did not. These runs cannot tell the
+  writes from the checkpoint as the boundary: at K1 and K2 neither existed, and at K3 the
+  step checkpoint was saved, which `"sync"` guarantees before the next step starts.
+- **Measured with SIGKILL, under `"async"`.** The immediate kill left neither saved and
+  the node re-ran in 40 of 40 runs on this host. That rate is a host-dependent
+  measurement, not a pinned property (see the last section). One parked read in run 1
+  caught the in-between state: the charge result present and `next=()`, which is the tool
+  task's writes applied on top of the model step's checkpoint. By the time of the kill the
+  step checkpoint had landed too, so that run's resume does not test the in-between state.
+  It shows only that the state exists and that a reader can see it.
 - **Measured in-process, by construction.**
   `test_pending_writes_alone_keep_a_finished_tool_step_from_running_again` uses a saver that
   drops every checkpoint after the model step, so the tool task's writes are the only
@@ -188,8 +206,10 @@ What is measured and what is read from source, separately:
   is.
 
 For a journal outside the graph (Plan 4) this means the dangerous window for a tool call is
-from the moment its request can reach the backend until its task's writes are saved, not
-until the step checkpoint is saved.
+from the moment its request can reach the backend until the first of its task's writes or
+its step checkpoint is saved. Under `"sync"` the next step cannot start before the
+checkpoint is saved. Under `"async"` it can, so the window can stay open while the graph
+has already moved on.
 
 ## Durability contrast (secondary)
 
@@ -219,24 +239,27 @@ parked read also counted 4 `checkpoints` rows, because the row count is a separa
 taken a moment after `get_state`, by which time the checkpoint had landed.) The child had
 already started its next step while its saves were still landing. What saved the other
 runs is the pause before the orchestrator's kill: it lands some milliseconds after the
-hook parks, which is time enough for the background saves to finish. So a supplementary kill point was
-measured, **after_tool_step_immediate**, where the child SIGKILLs itself the instant its
-second model call starts, with no row written and no pause. It is not one of the brief's
-three kill points, and it is labelled as supplementary in the tests too.
+hook parks, which is time enough for the background saves to finish. So a supplementary
+kill point was measured, **after_tool_step_immediate**, where the child SIGKILLs itself
+the instant its second model call starts, with no row written and no pause. It is not one
+of the brief's three kill points, and it is labelled as supplementary in the tests too.
 
 | First-process durability | Runs | Checkpoint at kill | Tool node on resume | Charge requests | Ledger |
 |---|---|---|---|---|---|
 | `"sync"` | 40 / 40 | tool step, holds the charge result | not re-run | 1 (`committed`) | 1 effect |
-| `"async"` | 40 / 40 | **model step only, no tool writes** (`next=("tool",)`) | **re-run** | **2**: `committed`, then `replayed` | 1 effect |
+| `"async"` | 40 / 40 on this host (rate recorded, not pinned) | **model step only, no tool writes** (`next=("tool",)`) | **re-run** | **2**: `committed`, then `replayed` | 1 effect |
 
 Under `"async"` the tool step had run to its end in the killed process (its `tool_events`
 row is there, with `replayed: false`), but neither the tool task's writes nor the step
 checkpoint reached the database, so the resume re-ran the tool node and sent the charge
-again; `tool_events` then holds two
-charge rows for turn 0. Under `"sync"` the same kill never lost the step. This is the
-direct evidence that the durability setting changes crash behaviour, which D11's fairness
-rule (every mode runs with `"sync"`) depends on: with LangGraph's default, `"async"`, a
-completed tool step can be lost and replayed even after it finished.
+again; `tool_events` then holds two charge rows for turn 0. Under `"sync"` the same kill
+never lost the step. This is the direct evidence that the durability setting changes crash
+behaviour, which D11's fairness rule (every mode runs with `"sync"`) depends on: with
+LangGraph's default, `"async"`, a completed tool step can be lost and replayed even after
+it finished. How often it is lost depends on how fast the host saves in the background,
+so the 40 of 40 here is a measurement on one Mac, not a rate to expect elsewhere. What
+does not depend on the host is the mechanism, pinned by `test_what_the_next_step_waits_for`:
+under `"async"` the next step starts without waiting for either save.
 
 ## Limits of this measurement
 
@@ -247,8 +270,8 @@ completed tool step can be lost and replayed even after it finished.
   experiment cannot say how often that happens.
 - Only `agent_directed` mode, one policy, one healthy world, and the controlled profile.
 - The `"async"` loss is a race by construction. It was the outcome in all 40 immediate-kill
-  runs here, on this machine; the suite asserts only that it happens at least once in a
-  batch and that each run is consistent with what its checkpoint held.
+  runs here, on this machine. The suite records the rate (test output and evidence) and
+  asserts only that each run's resume is consistent with what its checkpoint held.
 - `hold_after_commit` holds the response inside the simulator, so K2's kill is while the
   child waits for a response. A kill after the response arrives and before the
   `tool_events` row is written was not measured. By inference, not measurement, nothing of
@@ -267,7 +290,10 @@ fails the suite:
 - every cell of the primary table (K1, K2, K3 under `"sync"`);
 - the `"exit"` row: no checkpoint, the resume refused, one effect;
 - the immediate kill under `"sync"`: the step checkpoint saved, no re-execution;
-- the in-process construction: tool task writes alone, `next=()`, no re-execution.
+- the in-process construction: tool task writes alone, `next=()`, no re-execution;
+- what the next step waits for (the table in "Where exactly the boundary is"):
+  `"sync"` waits for the step checkpoint and neither durability waits for the task's
+  writes. This is deterministic, with timeouts so a regression fails instead of hanging.
 
 Recorded measurements only, not pinned:
 
@@ -276,10 +302,9 @@ Recorded measurements only, not pinned:
   run's resume is consistent with the state it found, because which state a run lands in
   is a race.
 - The immediate kill under `"async"` ("neither saved, re-run", 40 of 40). The test checks
-  each run for consistency in the same way and requires at least one run per batch to show
-  the loss, so a LangGraph change that makes `"async"` save before the next step starts
-  fails. It does not require every run to lose the step, and on a faster host a batch
-  could in principle show none and fail; that has not been observed.
+  each run for consistency in the same way and reports the loss rate in its output (as a
+  printed line and a `record_property`) and in the evidence file. It asserts no rate,
+  because a correct LangGraph can save before the kill on a faster host.
 
 Since this document's first version, the evidence for each run also records which of the
 three states its checkpoint reads were in (`boundary`: `tool_step_not_saved`,
