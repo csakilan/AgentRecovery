@@ -54,6 +54,17 @@ CONTROLLED_USER = (
 )
 
 
+def assert_same_serialization(got: Any, expected: Any) -> None:
+    """Equal as data and equal as the JSON the model receives.
+
+    Dict `==` ignores key order, but the model reads the serialized text, where order is
+    visible and is part of what the prior benchmark sent. `json.dumps` without `sort_keys`
+    keeps insertion order, so a reordered key fails here even though `==` still holds.
+    """
+    assert got == expected
+    assert json.dumps(got) == json.dumps(expected)
+
+
 def names(schemas: list[dict[str, Any]]) -> list[str]:
     return [schema["name"] for schema in schemas]
 
@@ -92,7 +103,7 @@ def test_compat_schemas_equal_vendored_tools(status_available: bool) -> None:
     expected = (
         TOOLS if status_available else [t for t in TOOLS if t["name"] != "get_payment_status"]
     )
-    assert tool_schemas(Profile.COMPAT, status_available) == expected
+    assert_same_serialization(tool_schemas(Profile.COMPAT, status_available), expected)
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
@@ -127,12 +138,12 @@ def test_compat_user_prompt_reads_49_99_not_a_padded_or_float_artifact() -> None
 
 
 def test_controlled_schemas_match_the_roadmap() -> None:
-    assert tool_schemas(Profile.CONTROLLED, True) == CONTROLLED_SPEC
+    assert_same_serialization(tool_schemas(Profile.CONTROLLED, True), CONTROLLED_SPEC)
 
 
 def test_controlled_schemas_without_status_match_the_roadmap_minus_status() -> None:
     expected = [t for t in CONTROLLED_SPEC if t["name"] != "get_payment_status"]
-    assert tool_schemas(Profile.CONTROLLED, False) == expected
+    assert_same_serialization(tool_schemas(Profile.CONTROLLED, False), expected)
 
 
 def test_controlled_forbids_additional_properties_on_every_tool() -> None:
@@ -209,7 +220,9 @@ def test_status_tool_removed_when_unavailable(profile: Profile) -> None:
 def test_removing_status_leaves_the_other_schemas_untouched(profile: Profile) -> None:
     full = tool_schemas(profile, True)
     reduced = tool_schemas(profile, False)
-    assert reduced == [schema for schema in full if schema["name"] != "get_payment_status"]
+    assert_same_serialization(
+        reduced, [schema for schema in full if schema["name"] != "get_payment_status"]
+    )
 
 
 # --- the scripted model against the schemas ------------------------------------------------
@@ -307,5 +320,5 @@ def test_unknown_profile_is_rejected_by_user_prompt() -> None:
 
 
 def test_plain_string_profiles_are_accepted_because_profile_is_a_str_enum() -> None:
-    assert tool_schemas("compat", True) == TOOLS  # type: ignore[arg-type]
+    assert_same_serialization(tool_schemas("compat", True), TOOLS)  # type: ignore[arg-type]
     assert user_prompt(DEFAULT_TASK, "controlled") == CONTROLLED_USER  # type: ignore[arg-type]
