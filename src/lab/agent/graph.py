@@ -33,19 +33,16 @@ from langgraph.types import Durability
 from psycopg import Connection
 from psycopg.types.json import Jsonb
 
-from lab.agent.executor import Executor, ToolOutcome
+from lab.agent.executor import (
+    RULE_NOT_EXECUTED_AFTER_DONE,
+    RULE_REPORT_DONE,
+    Executor,
+    ToolOutcome,
+    not_sent_outcome,
+)
 from lab.agent.model import ModelClient, ModelTurn, ToolCall
 
 REPORT_DONE = "report_done"
-
-# `tool_events.rule` values this module produces.
-RULE_REPORT_DONE = "report_done"
-RULE_NOT_EXECUTED_AFTER_DONE = "not_executed_after_report_done"
-
-# Placeholder model-facing text for the two cases the executor never sees. Plan 3 owns
-# observation wording (see lab.agent.executor.render_observation).
-_REPORT_DONE_OBSERVATION = "Outcome recorded. The task has ended."
-_NOT_EXECUTED_OBSERVATION = "Not executed: the task ended earlier in this turn."
 
 EndedBy = Literal["report_done", "max_turns"]
 
@@ -148,19 +145,6 @@ class PostgresRecorder:
         )
 
 
-def _not_sent(call: ToolCall, rule: str, observation: str) -> ToolOutcome:
-    key = call.arguments.get("idempotency_key")
-    return ToolOutcome(
-        requested_args=dict(call.arguments),
-        requested_key=key if isinstance(key, str) else None,
-        effective_args=None,
-        effective_key=None,
-        rule=rule,
-        observation=observation,
-        http_status=None,
-    )
-
-
 def _claimed_outcome(arguments: dict[str, Any]) -> str | None:
     outcome = arguments.get("outcome")
     return None if outcome is None else str(outcome)
@@ -213,11 +197,11 @@ def build_graph(
         for raw in messages[-1]["tool_calls"]:
             call = ToolCall(**raw)
             if done:
-                outcome = _not_sent(call, RULE_NOT_EXECUTED_AFTER_DONE, _NOT_EXECUTED_OBSERVATION)
+                outcome = not_sent_outcome(call, RULE_NOT_EXECUTED_AFTER_DONE)
             elif call.name == REPORT_DONE:
                 done = True
                 claimed = _claimed_outcome(call.arguments)
-                outcome = _not_sent(call, RULE_REPORT_DONE, _REPORT_DONE_OBSERVATION)
+                outcome = not_sent_outcome(call, RULE_REPORT_DONE)
             else:
                 outcome = executor.execute(call)
             recorder.record_tool_event(turn=turn, tool=call.name, outcome=outcome)

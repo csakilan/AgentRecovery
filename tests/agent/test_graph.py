@@ -8,6 +8,7 @@ the real SIGKILL version is Task 7.
 """
 
 import inspect
+import json
 import uuid
 from types import SimpleNamespace
 
@@ -21,7 +22,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from lab.agent.client import SimulatorClient, TrustedContext
-from lab.agent.executor import DirectExecutor, ToolOutcome, render_observation
+from lab.agent.executor import DirectExecutor, ToolOutcome, render_observation, requested_key_of
 from lab.agent.graph import PostgresRecorder, build_graph, run_episode
 from lab.agent.model import ModelTurn, ToolCall
 from lab.agent.scripted import ScriptedModel
@@ -246,6 +247,39 @@ def test_calls_after_report_done_in_the_same_turn_are_recorded_but_not_executed(
     assert skipped.effective_args is None and skipped.effective_key is None
     assert skipped.http_status is None
     assert [m["role"] for m in state["messages"]][-4:] == ["tool"] * 4
+
+
+def test_every_tool_message_the_graph_emits_comes_from_the_renderer():
+    # One turn that exercises all three producers: an executed call, report_done, and calls
+    # after it. A DirectExecutor over a mock transport makes the executed call real.
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"a": 1})))
+    client = SimulatorClient("http://sim:8100", TOKEN, CTX, http_client=http)
+    model = SequenceModel([turn_of(charge("a"), done(), charge("b"), done("failed"))])
+    graph, recorder, _ = memory_graph(model, executor=DirectExecutor(client))
+    state = run_episode(graph, thread(), START)
+
+    messages = [m for m in state["messages"] if m["role"] == "tool"]
+    expected = [
+        render_observation("agent_directed", http_status=200, body={"a": 1}),
+        render_observation("report_done"),
+        render_observation("not_executed_after_report_done"),
+        render_observation("not_executed_after_report_done"),
+    ]
+    assert [m["content"] for m in messages] == expected
+    assert [e["outcome"].observation for e in recorder.tool_events] == expected
+    shapes = [sorted(json.loads(m["content"])) for m in messages]
+    assert shapes == [["body", "http_status"], ["notice"], ["notice"], ["notice"]]
+
+
+def test_graph_rows_derive_requested_key_with_the_executors_rule():
+    args = {"order_id": "1", "idempotency_key": 7}
+    model = SequenceModel(
+        [turn_of(done(), ("charge", args), ("report_done", {"idempotency_key": "z"}))]
+    )
+    graph, recorder, _ = memory_graph(model)
+    run_episode(graph, thread(), START)
+    keys = [e["outcome"].requested_key for e in recorder.tool_events]
+    assert keys == [None, requested_key_of(args), "z"] == [None, None, "z"]
 
 
 # The turn cap

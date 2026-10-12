@@ -11,7 +11,13 @@ import pytest
 from pydantic import ValidationError
 
 from lab.agent.client import SimulatorClient, TrustedContext
-from lab.agent.executor import DirectExecutor, ToolOutcome, render_observation
+from lab.agent.executor import (
+    DirectExecutor,
+    ToolOutcome,
+    not_sent_outcome,
+    render_observation,
+    requested_key_of,
+)
 from lab.agent.model import ToolCall
 
 CTX = TrustedContext(
@@ -148,3 +154,32 @@ def test_observations_are_compact_json_made_in_one_place():
     for rule in ("namespace_argument_denied", "unknown_tool", "invalid_arguments"):
         error = json.loads(render_observation(rule))["error"]
         assert error["code"] == rule and error["message"]
+
+
+def test_the_graph_rules_are_rendered_here_as_fixed_notices_not_errors():
+    for rule in ("report_done", "not_executed_after_report_done"):
+        notice = json.loads(render_observation(rule))["notice"]
+        assert notice["code"] == rule and notice["message"]
+        assert render_observation(rule) == render_observation(rule)  # fixed text
+
+
+def test_not_sent_outcome_is_the_one_shape_for_every_call_that_sends_nothing():
+    for rule in ("report_done", "not_executed_after_report_done", "unknown_tool"):
+        c = call("x", {"idempotency_key": "k1", "outcome": "succeeded"})
+        outcome = not_sent_outcome(c, rule)
+        assert outcome == ToolOutcome(
+            requested_args=c.arguments,
+            requested_key="k1",
+            effective_args=None,
+            effective_key=None,
+            rule=rule,
+            observation=render_observation(rule),
+            http_status=None,
+        )
+
+
+def test_the_requested_key_is_a_string_idempotency_key_or_none():
+    assert requested_key_of({"idempotency_key": "k"}) == "k"
+    for arguments in ({}, {"idempotency_key": 7}, {"idempotency_key": None}):
+        assert requested_key_of(arguments) is None
+        assert not_sent_outcome(call("x", arguments), "unknown_tool").requested_key is None
