@@ -56,6 +56,7 @@ RUNTIME_SVC_PASSWORD = os.environ.get("LAB_RUNTIME_SVC_PASSWORD", "dev-runtime-s
 @pytest.fixture(scope="session")
 def runtime_db():
     from lab.runtime import RUNTIME_MIGRATIONS
+    from lab.runtime.checkpoints import setup_checkpoint_tables
 
     name = f"runtime_test_{uuid.uuid4().hex[:8]}"
     db.ensure_role(ADMIN_URL, "runtime_svc", RUNTIME_SVC_PASSWORD)
@@ -63,6 +64,7 @@ def runtime_db():
     try:
         admin_url = db.with_database(ADMIN_URL, name)
         db.apply_migrations(admin_url, RUNTIME_MIGRATIONS)
+        setup_checkpoint_tables(admin_url)
         yield {
             "name": name,
             "admin": admin_url,

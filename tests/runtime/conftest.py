@@ -8,9 +8,11 @@ def truncate_runtime_tables(runtime_db):
     """Empty every runtime table. The list comes from the database, so a table a later
     migration adds is cleaned without anyone remembering to edit this file.
 
-    `schema_migrations` is the one table left alone: truncating it would make
-    `apply_migrations` run 0001 again and fail with "table already exists", which would
-    break the idempotence test for the wrong reason. TRUNCATE needs the admin connection,
+    `schema_migrations` is left alone: truncating it would make `apply_migrations` run 0001
+    again and fail with "table already exists", which would break the idempotence test for
+    the wrong reason. `checkpoint_migrations` (LangGraph's own version record) is left alone
+    for the same reason: it describes tables that still exist. The other checkpoint tables
+    are emptied like any other. TRUNCATE needs the admin connection,
     because `runtime_svc` is deliberately not granted it.
     """
 
@@ -20,7 +22,8 @@ def truncate_runtime_tables(runtime_db):
                 row[0]
                 for row in conn.execute(
                     "SELECT tablename FROM pg_tables"
-                    " WHERE schemaname = 'public' AND tablename <> 'schema_migrations'"
+                    " WHERE schemaname = 'public'"
+                    " AND tablename NOT IN ('schema_migrations', 'checkpoint_migrations')"
                     " ORDER BY tablename"
                 )
             ]

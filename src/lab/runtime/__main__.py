@@ -16,6 +16,7 @@ import sys
 
 from lab import db
 from lab.runtime import RUNTIME_MIGRATIONS
+from lab.runtime.checkpoints import setup_checkpoint_tables
 
 
 def _migrate() -> None:
@@ -23,7 +24,10 @@ def _migrate() -> None:
     dbname = os.environ.get("LAB_RUNTIME_DB", "runtime")
     db.ensure_role(admin, "runtime_svc", os.environ["LAB_RUNTIME_SVC_PASSWORD"])
     db.ensure_database(admin, dbname)
-    applied = db.apply_migrations(db.with_database(admin, dbname), RUNTIME_MIGRATIONS)
+    runtime_admin = db.with_database(admin, dbname)
+    applied = db.apply_migrations(runtime_admin, RUNTIME_MIGRATIONS)
+    # LangGraph's checkpoint tables, after the role exists so the grants can name it.
+    setup_checkpoint_tables(runtime_admin)
     print(f"applied: {applied or 'nothing new'}")
 
 

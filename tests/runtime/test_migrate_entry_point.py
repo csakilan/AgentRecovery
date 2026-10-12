@@ -5,6 +5,7 @@ import pytest
 
 from lab import db
 from lab.runtime.__main__ import main
+from lab.runtime.checkpoints import CHECKPOINT_TABLES
 
 
 @pytest.fixture
@@ -20,13 +21,22 @@ def scratch_runtime_name(monkeypatch, admin_url, runtime_svc_password):
         db.drop_database(admin_url, name)
 
 
-def test_migrate_creates_the_database_named_by_the_environment(scratch_runtime_name, capsys):
+def test_migrate_creates_the_database_named_by_the_environment(
+    scratch_runtime_name, capsys, runtime_svc_password
+):
     name, admin = scratch_runtime_name
+    svc_password = runtime_svc_password
     main(["lab.runtime", "migrate"])
     assert "0001_init.sql" in capsys.readouterr().out
     with psycopg.connect(db.with_database(admin, name), autocommit=True) as conn:
         tables = {r[0] for r in conn.execute("SELECT tablename FROM pg_tables")}
     assert {"experiments", "runs", "model_calls", "schema_migrations"} <= tables
+    # LangGraph's checkpoint tables are created by the same command, and runtime_svc can use
+    # them: it is the role the graph connects as.
+    assert set(CHECKPOINT_TABLES) <= tables
+    with psycopg.connect(db.with_database(admin, name, "runtime_svc", svc_password)) as conn:
+        for table in CHECKPOINT_TABLES:
+            conn.execute(f"SELECT count(*) FROM {table}")
 
 
 def test_migrate_is_safe_to_run_twice(scratch_runtime_name, capsys):
