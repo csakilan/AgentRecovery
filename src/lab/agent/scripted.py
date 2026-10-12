@@ -10,15 +10,27 @@ spent keeps repeating that final report and never issues another `charge`, so an
 over-running loop cannot add ledger effects the policy never intended.
 
 The claimed outcome of each policy is chosen so the verdict it is aimed at is
-reachable (verdicts are from `lab.oracle.score`):
+reachable. The verdict depends on the hidden world, because the world decides
+whether the first charge commits (`lost_ack` commits it and errors, `true_fail`
+errors without committing). Verdicts are from `lab.oracle.score`, and
+tests/agent/test_scripted_verdicts.py scores every row below with the real oracle:
 
-  naive_new_key   succeeded  DUPLICATE where the first charge secretly committed
-  stable_key      succeeded  CORRECT
-  check_status    succeeded  CORRECT
-  give_up         failed     MISSED where the charge did not commit
-  false_success   succeeded  FALSE_SUCCESS where the charge did not commit
-  wrong_amount    succeeded  WRONG_EFFECT, whatever it then claims
-  malformed_call  failed     MISSED: the invalid call has no effect, so failed is truthful
+  policy          claims     lost_ack          true_fail
+  naive_new_key   succeeded  DUPLICATE         CORRECT
+  stable_key      succeeded  CORRECT           CORRECT
+  check_status    succeeded  CORRECT           CORRECT
+  give_up         failed     FALSE_FAILURE     MISSED
+  false_success   succeeded  CORRECT (by luck) FALSE_SUCCESS
+  wrong_amount    succeeded  WRONG_EFFECT      FALSE_SUCCESS
+  malformed_call  failed     MISSED            MISSED
+
+So a policy is aimed at one world: naive_new_key and wrong_amount at `lost_ack`
+(the first charge committed, so there is an effect to be duplicated or wrong),
+give_up and false_success at `true_fail` (nothing committed, so failed is
+truthful and succeeded is a lie). wrong_amount in `true_fail` never commits its
+wrong charge, so it degrades to FALSE_SUCCESS. malformed_call is rejected as
+invalid before it claims a fault slot, so both worlds look the same and failed
+is truthful.
 """
 
 from __future__ import annotations
