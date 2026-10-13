@@ -8,7 +8,6 @@ the real SIGKILL version is Task 7.
 """
 
 import inspect
-import json
 import uuid
 from types import SimpleNamespace
 
@@ -37,6 +36,7 @@ START = [
     {"role": "system", "content": "You are a payments agent."},
     {"role": "user", "content": "Charge order 1234 for 49.99 USD."},
 ]
+CHARGED = {"message": "Charge succeeded.", "replayed": False}
 TOKEN = "client-t"
 CONTROL = {"Authorization": "Bearer control-t"}
 NAMESPACE = "ns-graph"
@@ -61,7 +61,7 @@ class MemoryRecorder:
 
 
 class FakeExecutor:
-    """Answers every call with a 200 and remembers what it was asked."""
+    """Answers every call as a successful charge and remembers what it was asked."""
 
     def __init__(self):
         self.calls: list[ToolCall] = []
@@ -75,7 +75,9 @@ class FakeExecutor:
             effective_args=call.arguments,
             effective_key=key,
             rule="agent_directed",
-            observation=render_observation("agent_directed", http_status=200, body={"ok": True}),
+            observation=render_observation(
+                "agent_directed", tool="charge", http_status=200, body=CHARGED
+            ),
             http_status=200,
         )
 
@@ -163,7 +165,7 @@ def test_messages_have_the_shapes_the_scripted_model_and_a_provider_expect():
         "role": "tool",
         "tool_call_id": "scripted_give_up_0",
         "name": "charge",
-        "content": '{"http_status":200,"body":{"ok":true}}',
+        "content": "Charge succeeded.",
     }
 
 
@@ -252,7 +254,7 @@ def test_calls_after_report_done_in_the_same_turn_are_recorded_but_not_executed(
 def test_every_tool_message_the_graph_emits_comes_from_the_renderer():
     # One turn that exercises all three producers: an executed call, report_done, and calls
     # after it. A DirectExecutor over a mock transport makes the executed call real.
-    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"a": 1})))
+    http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=CHARGED)))
     client = SimulatorClient("http://sim:8100", TOKEN, CTX, http_client=http)
     model = SequenceModel([turn_of(charge("a"), done(), charge("b"), done("failed"))])
     graph, recorder, _ = memory_graph(model, executor=DirectExecutor(client))
@@ -260,15 +262,16 @@ def test_every_tool_message_the_graph_emits_comes_from_the_renderer():
 
     messages = [m for m in state["messages"] if m["role"] == "tool"]
     expected = [
-        render_observation("agent_directed", http_status=200, body={"a": 1}),
+        render_observation("agent_directed", tool="charge", http_status=200, body=CHARGED),
         render_observation("report_done"),
         render_observation("not_executed_after_report_done"),
         render_observation("not_executed_after_report_done"),
     ]
     assert [m["content"] for m in messages] == expected
     assert [e["outcome"].observation for e in recorder.tool_events] == expected
-    shapes = [sorted(json.loads(m["content"])) for m in messages]
-    assert shapes == [["body", "http_status"], ["notice"], ["notice"], ["notice"]]
+    # The renderer's text is what the model reads, so pin the three kinds it made here.
+    assert expected[:2] == ["Charge succeeded.", "Recorded."]
+    assert expected[2].startswith("Not executed: ")
 
 
 def test_graph_rows_derive_requested_key_with_the_executors_rule():
@@ -540,7 +543,9 @@ def test_an_episode_against_the_simulator_is_recorded_row_by_row(
     for event in (first, second):
         assert event["requested_args_json"] == event["effective_args_json"]
         assert event["requested_key"] == event["effective_key"] == "k1"
-    assert second["observation"].startswith('{"http_status":200,"body":')
+    assert first["observation"].startswith(f"HTTP {first['http_status']} ")
+    assert second["observation"].startswith("Idempotent hit: ")
+    assert report["observation"] == "Recorded."
     assert report["http_status"] is None
     assert report["effective_args_json"] is None and report["effective_key"] is None
     assert report["requested_args_json"] == {"outcome": "succeeded"}

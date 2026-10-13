@@ -73,6 +73,13 @@ ledger; `tool_events`; `model_calls`. `tool_events` is cross-checked against `ca
 because a kill after a request is sent and before its event row is written leaves a request
 the runtime never recorded.
 
+A "charge result" in the graph is the text of the `charge` tool message, which is what the
+model reads. That text is RetryLedger's (`lab.protocol.render`), so it does not carry the
+simulator's `replayed` field: a fresh commit reads `Charge succeeded.` and a replay reads
+`Idempotent hit: a payment already succeeded under this key. No additional charge was made.`
+The tables below say "fresh" and "replay" for those two texts. The `replayed` flag itself
+is read from the simulator's `call_log`, which is where it is recorded.
+
 ## Repetitions and the command
 
 The suite runs each test with 3 repetitions per kill point and 2 per contrast case, three
@@ -112,7 +119,7 @@ one checkpoint read noted under the contrast.
 | Charge requests that reached the simulator | 1 (`committed`) | **2**: `committed`, then `replayed` | 1 (`committed`) |
 | Second request answered as replay | n/a | **yes, `replayed: true`** | n/a |
 | Ledger after resume | **1 effect** | **1 effect** | **1 effect** |
-| Charge results in the resumed graph | 1, fresh (`replayed: false`) | **1, the replay's** (`replayed: true`) | 1, fresh, the first attempt's |
+| Charge results in the resumed graph | 1, fresh (`Charge succeeded.`) | **1, the replay's** (`Idempotent hit: ...`) | 1, fresh, the first attempt's |
 | Did the graph see the first attempt's result | there was none | **no** | yes, from the checkpoint |
 | `tool_events` charge rows | 1 | 1 | 1 |
 | `call_log` requests absent from `tool_events` | 0 | **1** | 0 |
@@ -250,7 +257,7 @@ of the brief's three kill points, and it is labelled as supplementary in the tes
 | `"async"` | 40 / 40 on this host (rate recorded, not pinned) | **model step only, no tool writes** (`next=("tool",)`) | **re-run** | **2**: `committed`, then `replayed` | 1 effect |
 
 Under `"async"` the tool step had run to its end in the killed process (its `tool_events`
-row is there, with `replayed: false`), but neither the tool task's writes nor the step
+row is there, holding the fresh result), but neither the tool task's writes nor the step
 checkpoint reached the database, so the resume re-ran the tool node and sent the charge
 again; `tool_events` then holds two charge rows for turn 0. Under `"sync"` the same kill
 never lost the step. This is the direct evidence that the durability setting changes crash

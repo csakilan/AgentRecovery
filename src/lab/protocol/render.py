@@ -18,9 +18,19 @@ REASONS = {
 }
 
 
+def reason_phrase(http_status: int) -> str:
+    """The reason phrase in "HTTP <status> <reason>: ..." lines ("Error" if not listed).
+
+    200 is "OK". `render_charge` and `render_status` never print a reason for 200, so this
+    changes nothing they produce; it is for callers that must describe a 200 they cannot
+    render."""
+    if http_status == 200:
+        return "OK"
+    return REASONS.get(http_status, "Error")
+
+
 def _error_text(http_status: int, body: dict[str, Any]) -> str:
-    reason = REASONS.get(http_status, "Error")
-    return f"HTTP {http_status} {reason}: {body['error']['message']}"
+    return f"HTTP {http_status} {reason_phrase(http_status)}: {body['error']['message']}"
 
 
 def render_charge(http_status: int, body: dict[str, Any]) -> str:

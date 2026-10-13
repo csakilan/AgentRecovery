@@ -9,6 +9,18 @@ requested. Plan 3's other executors will differ in what they send, not in this r
 
 `report_done` never reaches an executor. It is not a request to the simulator, and the graph
 handles it.
+
+What the model reads. The text of a tool result comes from `lab.protocol.render`
+(`render_charge` and `render_status`), not from this module, because the compat profile
+promises that the model sees tool results byte-identical to the original RetryLedger
+benchmark, and `render.py` is where that promise is kept and tested (tests/oracle and
+tests/simulator). Rendering the simulator's JSON here instead would break the promise in the
+one place the model actually reads it. `render_observation` is the only place this package
+produces that text; it adds only what `render.py` cannot say (a body it has no case for, and
+the calls that sent nothing). tests/agent/test_observation_parity.py compares a whole agent
+episode, tool message by tool message, with the vendored RetryLedger. The wording here is a
+pilot placeholder for the cases RetryLedger never had; Plan 3 owns any change to it, since
+how a failure is worded is itself an experimental variable there.
 """
 
 from __future__ import annotations
@@ -20,6 +32,7 @@ from pydantic import BaseModel, ConfigDict
 
 from lab.agent.client import DENIED_STATUS, NAMESPACE_DENIED, SimulatorClient
 from lab.agent.model import ToolCall
+from lab.protocol.render import reason_phrase, render_charge, render_status
 
 # `tool_events.rule` values this module produces.
 RULE_AGENT_DIRECTED = "agent_directed"
@@ -29,46 +42,69 @@ RULE_INVALID_ARGUMENTS = "invalid_arguments"
 RULE_REPORT_DONE = "report_done"
 RULE_NOT_EXECUTED_AFTER_DONE = "not_executed_after_report_done"
 
+TOOL_CHARGE = "charge"
+TOOL_STATUS = "get_payment_status"
+
 # The model-facing text of every call that sent no request, keyed by `rule`. Fixed on
-# purpose: none of it may echo anything a model wrote. The three refusals render under
-# "error"; the two graph rules are not errors and render under "notice".
-_ERRORS = {
+# purpose: none of it may echo anything a model wrote. The first two are RetryLedger's own
+# strings (its `handle()` answers "Recorded." to report_done and "Unknown tool." to a name it
+# does not know); RetryLedger had no case for the other three, so each is one plain sentence.
+_NOT_SENT_TEXT = {
+    RULE_REPORT_DONE: "Recorded.",
+    RULE_UNKNOWN_TOOL: "Unknown tool.",
     NAMESPACE_DENIED: (
-        "Tool arguments must not contain a namespace. "
-        "The namespace is fixed for this run and cannot be set by a tool call."
+        "Not executed: the namespace is fixed for this run and cannot be set by tool arguments."
     ),
-    RULE_UNKNOWN_TOOL: "No such tool.",
-    RULE_INVALID_ARGUMENTS: "The arguments for this tool call are missing or invalid.",
-}
-_NOTICES = {
-    RULE_REPORT_DONE: "Outcome recorded. The task has ended.",
+    RULE_INVALID_ARGUMENTS: (
+        "Not executed: the arguments for this tool call are missing or invalid."
+    ),
     RULE_NOT_EXECUTED_AFTER_DONE: "Not executed: the task ended earlier in this turn.",
 }
 
+_RENDERERS = {TOOL_CHARGE: render_charge, TOOL_STATUS: render_status}
+
 
 def render_observation(
-    rule: str, *, http_status: int | None = None, body: dict[str, Any] | None = None
+    rule: str,
+    *,
+    tool: str | None = None,
+    http_status: int | None = None,
+    body: dict[str, Any] | None = None,
 ) -> str:
     """The text the model reads as the result of a tool call. The only place it is made.
 
-    A request that was sent is rendered as `{"http_status": ..., "body": ...}`, compact, so
-    the model sees exactly the status and body the simulator answered with. A call that
-    never left the runtime (denied, unknown tool, invalid arguments) is rendered as a fixed
-    `{"error": {"code": ..., "message": ...}}` keyed by `rule`. The two calls the graph
-    handles itself (`report_done`, and a call after it in the same turn) are rendered as a
-    fixed `{"notice": {"code": ..., "message": ...}}`. Every tool message the graph appends
-    comes from here, so a change of wording or format here applies to all of them.
+    A request that was sent (`http_status` given, with `tool` "charge" or "get_payment_status")
+    is rendered by `render_charge` or `render_status` from lab.protocol.render, so the text is
+    the one RetryLedger showed. Those functions assume the bodies the simulator's own handlers
+    produce. A body they have no case for (a 401, 422 or router 404 carrying `detail`, a
+    `{"raw_body": ...}` from a response that was not JSON, any missing key) is rendered as one
+    line in the same style, `HTTP <status> <reason>: <body as compact JSON>`. The renderer
+    never raises because of a response body.
 
-    This wording is a placeholder for the pilot. Plan 3 owns the final observation format,
-    because how a failure is worded is itself an experimental variable there.
+    A call that sent nothing is rendered from the fixed `_NOT_SENT_TEXT`, keyed by `rule`.
+    Every tool message the graph appends comes from here.
     """
     if http_status is not None:
-        return json.dumps({"http_status": http_status, "body": body}, separators=(",", ":"))
-    if rule in _NOTICES:
-        return json.dumps(
-            {"notice": {"code": rule, "message": _NOTICES[rule]}}, separators=(",", ":")
+        return _render_response(tool, http_status, body)
+    return _NOT_SENT_TEXT[rule]
+
+
+def _render_response(tool: str | None, http_status: int, body: dict[str, Any] | None) -> str:
+    render = _RENDERERS.get(tool) if tool is not None else None
+    if render is None:
+        # A caller bug, not something a response can cause.
+        raise ValueError(
+            f"a sent request is rendered for 'charge' or 'get_payment_status', not {tool!r}"
         )
-    return json.dumps({"error": {"code": rule, "message": _ERRORS[rule]}}, separators=(",", ":"))
+    try:
+        text = render(http_status, body)
+    except (LookupError, TypeError):
+        text = None
+    if isinstance(text, str):
+        return text
+    # ensure_ascii stays on: the escaped form is what a database and a log can always hold.
+    compact = json.dumps(body, separators=(",", ":"), default=str)
+    return f"HTTP {http_status} {reason_phrase(http_status)}: {compact}"
 
 
 class ToolOutcome(BaseModel):
@@ -145,6 +181,8 @@ class DirectExecutor:
             effective_args=dict(call.arguments),
             effective_key=requested_key_of(call.arguments),
             rule=RULE_AGENT_DIRECTED,
-            observation=render_observation(RULE_AGENT_DIRECTED, http_status=status, body=body),
+            observation=render_observation(
+                RULE_AGENT_DIRECTED, tool=call.name, http_status=status, body=body
+            ),
             http_status=status,
         )

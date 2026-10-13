@@ -249,19 +249,12 @@ class _NoRecorder:
         raise AssertionError("the probe graph only reads checkpoints")
 
 
-def _tool_body(content: str) -> dict[str, Any]:
-    parsed = json.loads(content)
-    body = parsed.get("body") or {}
-    return {"http_status": parsed.get("http_status"), "replayed": body.get("replayed")}
-
-
-def _charge_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """What the graph holds about the charge: one entry per `charge` tool message."""
-    return [
-        _tool_body(m["content"])
-        for m in messages
-        if m.get("role") == "tool" and m.get("name") == "charge"
-    ]
+def _charge_results(messages: list[dict[str, Any]]) -> list[str]:
+    """What the graph holds about the charge: the text the model was shown, one entry per
+    `charge` tool message. A fresh commit and a replay read differently (the simulator's
+    SUCCESS_MESSAGE and REPLAY_MESSAGE, which RetryLedger also tells apart), so the text alone
+    says whether the loop sent the charge twice."""
+    return [m["content"] for m in messages if m.get("role") == "tool" and m.get("name") == "charge"]
 
 
 def _checkpoint(probe, saver_conn, thread: str) -> dict[str, Any]:
@@ -343,7 +336,7 @@ def _tool_events(rt, run: str) -> list[dict[str, Any]]:
     for r in rows:
         event = {"turn": r["turn"], "tool": r["tool"], "http_status": r["http_status"]}
         if r["tool"] == "charge":
-            event["replayed"] = _tool_body(r["observation"])["replayed"]
+            event["replayed"] = r["observation"] == service.REPLAY_MESSAGE
         out.append(event)
     return out
 
@@ -517,12 +510,12 @@ def run_reps(lab: Lab, kill_point: str, reps: int, durability: str = "sync"):
         return list(pool.map(lambda rep: run_replay(lab, kill_point, rep, durability), range(reps)))
 
 
-def first_charge_answered_fresh() -> dict[str, Any]:
-    return {"http_status": 200, "replayed": False}
+def first_charge_answered_fresh() -> str:
+    return service.SUCCESS_MESSAGE
 
 
-def charge_answered_as_replay() -> dict[str, Any]:
-    return {"http_status": 200, "replayed": True}
+def charge_answered_as_replay() -> str:
+    return service.REPLAY_MESSAGE
 
 
 # The measurements. Each asserts every repetition, with the whole observation on failure.
@@ -591,7 +584,7 @@ def test_killed_after_commit_before_checkpoint_the_charge_is_replayed_and_absorb
         ], obs
         assert final["ledger_effects"] == 1, obs
         # The graph holds one charge result, the replay's. The first attempt left nothing in
-        # it; only the simulator's "replayed" answer says there was one.
+        # it; only the replay text ("Idempotent hit: ...") says there was one.
         assert resume["charge_results"] == [charge_answered_as_replay()], obs
         assert [(e["turn"], e["tool"]) for e in final["tool_events"]] == [
             (0, "charge"),
@@ -799,7 +792,9 @@ class _CountingExecutor:
             effective_args=dict(call.arguments),
             effective_key=requested_key_of(call.arguments),
             rule=RULE_AGENT_DIRECTED,
-            observation=render_observation(RULE_AGENT_DIRECTED, http_status=200, body=body),
+            observation=render_observation(
+                RULE_AGENT_DIRECTED, tool="charge", http_status=200, body=body
+            ),
             http_status=200,
         )
 
