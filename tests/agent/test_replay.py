@@ -49,10 +49,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -81,8 +83,10 @@ from lab.agent.scripted import ScriptedModel
 from lab.agent.tools import tool_schemas
 from lab.protocol.faults import FaultPlan
 from lab.protocol.task import DEFAULT_TASK, Profile
+from lab.runner.tracing import TRACING_VARIABLES
 from lab.simulator import service
 from lab.simulator.app import create_public_app
+from tests.network_guard import LOG_ENV, PROVIDER_HOSTS, read_log
 
 REPS = int(os.environ.get("LAB_REPLAY_REPS", "3"))
 CONTRAST_REPS = int(os.environ.get("LAB_REPLAY_CONTRAST_REPS", "2"))
@@ -167,8 +171,41 @@ class Lab:
         self.children: list[subprocess.Popen[str]] = []
         self.namespaces: list[str] = []
         self._lock = threading.Lock()
+        # Each child's network guard appends the connections it refused to its own file here.
+        self._guard_dir = tempfile.mkdtemp(prefix="replay-guard-")
+        self._guard_logs: dict[int, str] = {}
 
-    def spawn(self, ids: dict[str, str], *, hook: str, durability: str, resume: bool):
+    def blocked_attempts(self, *children: subprocess.Popen[str]) -> list[str]:
+        """What the guards of `children` (default: every child started) refused."""
+        with self._lock:
+            logs = [self._guard_logs[c.pid] for c in children] or list(self._guard_logs.values())
+        return [line for log in logs for line in read_log(log)]
+
+    def forget_blocked_attempts(self, *children: subprocess.Popen[str]) -> None:
+        """Empty the guard logs of `children`. Only for a test that provoked a refusal on
+        purpose and has already asserted on it."""
+        with self._lock:
+            logs = [self._guard_logs[c.pid] for c in children]
+        for log in logs:
+            Path(log).unlink(missing_ok=True)
+
+    def assert_no_blocked_attempts(self, *children: subprocess.Popen[str]) -> None:
+        """Fail if a worker tried to leave the machine. The workers run the whole graph with
+        a model chosen inside the worker, so this is where a real provider client added to a
+        worker would be caught. It reads the log, not the exit code: a worker killed by the
+        orchestrator has no exit code to read, and one that swallowed the error has a good one."""
+        attempts = self.blocked_attempts(*children)
+        assert not attempts, f"a replay worker tried to leave the machine: {attempts}"
+
+    def spawn(
+        self,
+        ids: dict[str, str],
+        *,
+        hook: str,
+        durability: str,
+        resume: bool,
+        probe_host: str | None = None,
+    ):
         command = [
             sys.executable,
             str(WORKER),
@@ -187,19 +224,23 @@ class Lab:
         ]
         if resume:
             command.append("--resume")
+        if probe_host is not None:
+            command += ["--probe-host", probe_host]
+        guard_log = os.path.join(self._guard_dir, f"{uuid.uuid4().hex}.log")
         env = {
             **os.environ,
             "LAB_REPLAY_RUNTIME_URL": self.runtime,
             "LAB_REPLAY_SIM_URL": self.sim_url,
             "LAB_REPLAY_CLIENT_TOKEN": TOKEN,
-            "LANGSMITH_TRACING": "false",
-            "LANGCHAIN_TRACING_V2": "false",
+            LOG_ENV: guard_log,
+            **dict.fromkeys(TRACING_VARIABLES, "false"),
         }
         child = subprocess.Popen(
             command, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         with self._lock:
             self.children.append(child)
+            self._guard_logs[child.pid] = guard_log
         return child
 
     def add_namespace(self, namespace: str) -> None:
@@ -208,11 +249,16 @@ class Lab:
 
     def cleanup(self) -> None:
         """Kill any child still alive and release every barrier this module could hold."""
-        for child in self.children:
-            _reap(child)
-        with psycopg.connect(self.sim_svc, autocommit=True) as conn:
-            for namespace in self.namespaces:
-                service.release_barrier(conn, namespace, BARRIER)
+        try:
+            for child in self.children:
+                _reap(child)
+            with psycopg.connect(self.sim_svc, autocommit=True) as conn:
+                for namespace in self.namespaces:
+                    service.release_barrier(conn, namespace, BARRIER)
+            # A last look at every worker of the module, in case a test did not check its own.
+            self.assert_no_blocked_attempts()
+        finally:
+            shutil.rmtree(self._guard_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="module")
@@ -493,6 +539,7 @@ def run_replay(lab: Lab, kill_point: str, rep: int, durability: str = "sync") ->
             obs["charge_requests_unrecorded_by_tool_events"] = len(final["call_log"]) - sum(
                 1 for e in final["tool_events"] if e["tool"] == "charge"
             )
+            lab.assert_no_blocked_attempts(first, resumed)
         finally:
             _reap(first)
             _reap(resumed)
@@ -978,3 +1025,60 @@ def test_what_the_next_step_waits_for(hold, durability, saved_before_next_step):
     assert outcome["state"]["claimed_outcome"] == "succeeded"
     assert saver.saved.wait(GUARD_S)  # the held save did complete in the end
     assert model.saved_at_second_call is saved_before_next_step
+
+
+# ---------------------------------------------------------------------------
+# The workers are held to the same no-network rule as the suite
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", [PROVIDER_HOSTS[0], PROVIDER_HOSTS[2], PROVIDER_HOSTS[3]])
+def test_a_worker_that_tries_to_leave_the_machine_fails_the_parent(lab, host):
+    """The worker runs the whole graph with a model of its own, so a provider client added
+    there would reach the network from a process the suite's socket patch does not cover.
+    Here a worker's first model call connects to a provider host and swallows the error, as a
+    retrying client would; the episode still finishes and prints its result. The worker exits
+    non-zero and its guard log names the host, and the orchestrator's check fails on it."""
+    suffix = uuid.uuid4().hex[:10]
+    ids = {
+        "experiment": f"e-probe-{suffix}",
+        "run": f"r-probe-{suffix}",
+        "thread": f"t-probe-{suffix}",
+        "namespace": f"probe-{suffix}",
+    }
+    with (
+        psycopg.connect(lab.runtime, autocommit=True, row_factory=dict_row) as rt,
+        psycopg.connect(lab.sim_svc, autocommit=True, row_factory=dict_row) as sim,
+        PostgresSaver.from_conn_string(lab.runtime) as saver,
+    ):
+        rt.execute(
+            "INSERT INTO experiments (id, name, manifest_sha256, config_json)"
+            " VALUES (%s, 'probe', 'probe', '{}')",
+            (ids["experiment"],),
+        )
+        rt.execute(
+            "INSERT INTO runs (id, experiment_id, episode_id, namespace, mode, thread_id, state)"
+            " VALUES (%s, %s, 'probe-episode', %s, 'agent_directed', %s, 'running')",
+            (ids["run"], ids["experiment"], ids["namespace"], ids["thread"]),
+        )
+        service.configure_namespace(sim, ids["namespace"], Profile.CONTROLLED, FaultPlan())
+        lab.add_namespace(ids["namespace"])
+        child = None
+        try:
+            child = lab.spawn(ids, hook="none", durability="sync", resume=False, probe_host=host)
+            out, err = child.communicate(timeout=SPAWN_TIMEOUT_S)
+            # The error was swallowed, so the episode itself ran to the end.
+            assert json.loads(out.strip().splitlines()[-1])["ok"] is True, (out, err)
+            assert child.returncode == 6, (child.returncode, err)
+            assert host in err
+            assert lab.blocked_attempts(child) == [f"dns {host}"]
+            with pytest.raises(AssertionError, match=host):
+                lab.assert_no_blocked_attempts(child)
+        finally:
+            _reap(child)
+            saver.delete_thread(ids["thread"])
+            rt.execute("DELETE FROM experiments WHERE id = %s", (ids["experiment"],))
+            # The attempt above was provoked on purpose: forget it, or the module's final
+            # check in Lab.cleanup would (rightly) fail on it.
+            if child is not None:
+                lab.forget_blocked_attempts(child)

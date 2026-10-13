@@ -26,17 +26,10 @@ import httpx
 import pytest
 
 from lab.runner.tracing import TRACING_VARIABLES, force_tracing_off
-from tests.network_guard import NetworkBlocked, NetworkGuard
+from tests.network_guard import PROVIDER_HOSTS, NetworkBlocked, NetworkGuard
 
 REPO = Path(__file__).resolve().parents[2]
 
-PROVIDER_HOSTS = (
-    "openrouter.ai",
-    "api.anthropic.com",
-    "api.openai.com",
-    "api.smith.langchain.com",
-    "eu.api.smith.langchain.com",
-)
 # Public addresses, never contacted: the guard refuses before a packet is sent.
 PUBLIC_IPS = ("8.8.8.8", "104.18.2.1", "172.217.14.206")
 
@@ -299,11 +292,20 @@ def _docstring_nodes(tree: ast.AST) -> set[int]:
     return nodes
 
 
-def test_no_source_file_imports_a_provider_sdk_or_names_a_provider_host():
-    files = sorted((REPO / "src" / "lab").rglob("*.py"))
-    assert len(files) > 20, "the scan found too few files to mean anything"
+# Files that may legitimately name a provider host, and only the host check is waived for
+# them (their imports are still scanned). Explicit and minimal on purpose. The replay test
+# and worker take their hosts from PROVIDER_HOSTS, so they need no entry.
+HOST_STRINGS_ALLOWED = {
+    "tests/network_guard.py": "defines PROVIDER_HOSTS, the one list of hosts to refuse",
+    "tests/runner/test_no_live_calls.py": "probes the hosts the guard must refuse",
+}
+
+
+def _scan(files: list[Path]) -> list[str]:
     problems: list[str] = []
     for path in files:
+        relative = path.relative_to(REPO).as_posix()
+        check_hosts = relative not in HOST_STRINGS_ALLOWED
         tree = ast.parse(path.read_text())
         docstrings = _docstring_nodes(tree)
         for node in ast.walk(tree):
@@ -315,13 +317,50 @@ def test_no_source_file_imports_a_provider_sdk_or_names_a_provider_host():
                 names = []
             for name in names:
                 if any(name == m or name.startswith(m + ".") for m in FORBIDDEN_MODULES):
-                    problems.append(f"{path.name}: imports {name}")
+                    problems.append(f"{relative}: imports {name}")
             if (
-                isinstance(node, ast.Constant)
+                check_hosts
+                and isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
                 and id(node) not in docstrings
             ):
                 for host in PROVIDER_HOSTS + ("smith.langchain.com",):
                     if host in node.value:
-                        problems.append(f"{path.name}: string mentions {host}")
-    assert problems == []
+                        problems.append(f"{relative}: string mentions {host}")
+                        break
+    return problems
+
+
+def test_no_source_file_imports_a_provider_sdk_or_names_a_provider_host():
+    files = sorted((REPO / "src" / "lab").rglob("*.py"))
+    assert len(files) > 20, "the scan found too few files to mean anything"
+    assert _scan(files) == []
+
+
+def test_no_test_file_or_worker_does_either_except_the_listed_ones():
+    """The replay workers (tests/agent/replay_worker.py) build and run the whole graph in a
+    child process with a model chosen there, so the scan covers everything under tests/."""
+    files = sorted((REPO / "tests").rglob("*.py"))
+    assert REPO / "tests" / "agent" / "replay_worker.py" in files
+    assert len(files) > 30, "the scan found too few files to mean anything"
+    assert _scan(files) == []
+    for relative in HOST_STRINGS_ALLOWED:
+        assert (REPO / relative).is_file(), f"{relative} is listed but does not exist"
+
+
+def test_the_scan_catches_what_it_is_for(tmp_path, monkeypatch):
+    bad = tmp_path / "worker.py"
+    bad.write_text(
+        '"""A docstring may name api.openai.com."""\n'
+        "import openai\n"
+        "from anthropic import Anthropic\n"
+        'URL = "https://openrouter.ai/api/v1"\n'
+        'F = f"https://api.smith.langchain.com/{1}"\n'
+    )
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    assert sorted(_scan([bad])) == [
+        "worker.py: imports anthropic",
+        "worker.py: imports openai",
+        "worker.py: string mentions api.smith.langchain.com",
+        "worker.py: string mentions openrouter.ai",
+    ]

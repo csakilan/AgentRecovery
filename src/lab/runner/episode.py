@@ -3,12 +3,18 @@
 Steps, in order, for `run_spec`:
 
 1. Refuse a mode other than `agent_directed` (this plan has one executor, `DirectExecutor`).
-2. Create or reuse the `experiments` row, then write a `runs` row in state `queued`.
-3. Move it to `running`, stamping `started_at` and `deadline_at`.
-4. Configure a fresh namespace through the simulator's control API (the spec's profile and
+2. Open the runtime connection and the ledger connection, and check the ledger one: it must
+   be the `ledger_reader` role, on a database other than the runtime one, able to read the
+   ledger tables. A wrong URL fails here, before anything is written and before a model is
+   called, so a misconfigured evaluator is found at no cost.
+3. Create or reuse the `experiments` row, then write a `runs` row in state `queued`.
+4. Move it to `running`, stamping `started_at` and `deadline_at`.
+5. Configure a fresh namespace through the simulator's control API (the spec's profile and
    fault plan), build the graph and run it with `durability="sync"`.
-5. Move the run to `completed` (or `crashed`, re-raising) and stamp `finished_at`.
-6. Read the ledger as `ledger_reader`, score it with the oracle, write one `results` row.
+6. Move the run to `completed` (or `crashed`, re-raising) and stamp `finished_at`.
+7. Score the ledger with the oracle through the connection opened in step 2 and write one
+   `results` row. If that fails the run becomes `score_failed` (not a bare `completed`), and
+   `rescore_run` can finish it later.
 
 What the model controls and what it does not. The model chooses tool arguments and the
 final claim. Everything that decides where a charge lands comes from here: the tenant is a
@@ -17,9 +23,9 @@ generated per run, and the episode id and task id come from the spec. They are p
 `TrustedContext`, which the simulator client reads once, and nothing in it is read back from
 a model message.
 
-The evaluator is kept apart from the agent's records on purpose. `evaluate_episode` opens
-the ledger with the `ledger_reader` URL (and refuses any other role), and its only other
-inputs are the spec, the namespace and the claim the graph returned. It never queries the
+The evaluator is kept apart from the agent's records on purpose. `open_ledger` connects with
+the `ledger_reader` URL (and refuses any other role), and scoring's only other inputs are the
+spec, the namespace and the claim the graph returned. It never queries the
 runtime database, so a verdict cannot be influenced by rows the agent side wrote.
 
 The checkpointer is a `PostgresSaver` as `runtime_svc`. The runner never calls `setup()`:
@@ -34,7 +40,8 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -90,8 +97,18 @@ class EpisodeAlreadyRunError(RunnerError):
     """The experiment already has a run for this episode id."""
 
 
-class EvaluatorRoleError(RunnerError):
+class LedgerConfigError(RunnerError):
+    """The ledger URL cannot be used to evaluate: it does not connect, or it is not the
+    evaluator's view of the payments database."""
+
+
+class EvaluatorRoleError(LedgerConfigError):
     """The ledger connection is not the `ledger_reader` role."""
+
+
+class ScoringError(RunnerError):
+    """The episode ran but its verdict could not be written. The run is `score_failed`;
+    `rescore_run` finishes it."""
 
 
 @dataclass(frozen=True)
@@ -286,6 +303,61 @@ def configure_namespace(config: RunnerConfig, namespace: str, spec: EpisodeSpec)
         )
 
 
+LEDGER_TABLES = ("charges", "call_log")
+
+
+@contextmanager
+def open_ledger(
+    ledger_url: str, runtime_conn: psycopg.Connection[Any] | None = None
+) -> Iterator[psycopg.Connection[Any]]:
+    """Connect to the ledger as the evaluator and check the connection is the right one.
+
+    Checked before the connection is returned: it opens; the user is `ledger_reader`
+    (`EvaluatorRoleError` otherwise); the database is not the runtime database `runtime_conn`
+    is on, so the evaluator cannot be pointed at the agent's own records; and the ledger tables
+    can be read. Anything wrong is a `LedgerConfigError`."""
+    try:
+        conn = psycopg.connect(ledger_url, autocommit=True)
+    except psycopg.OperationalError as exc:
+        raise LedgerConfigError(f"cannot connect to the ledger: {exc}") from exc
+    try:
+        user, dbname = conn.execute("SELECT current_user, current_database()").fetchone()
+        if user != LEDGER_ROLE:
+            raise EvaluatorRoleError(
+                f"the evaluator must read the ledger as {LEDGER_ROLE!r}, not {user!r}"
+            )
+        if runtime_conn is not None:
+            runtime_db = runtime_conn.execute("SELECT current_database()").fetchone()[0]
+            if dbname == runtime_db:
+                raise LedgerConfigError(
+                    f"the ledger URL points at the runtime database {runtime_db!r}"
+                )
+        for table in LEDGER_TABLES:
+            try:
+                conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
+            except psycopg.Error as exc:
+                raise LedgerConfigError(
+                    f"{LEDGER_ROLE} cannot read {table!r} in database {dbname!r}: {exc}"
+                ) from exc
+        yield conn
+    finally:
+        conn.close()
+
+
+def score_ledger(
+    ledger: psycopg.Connection[Any],
+    namespace: str,
+    spec: EpisodeSpec,
+    raw_claim: str | None,
+    completed_before_deadline: bool,
+) -> EpisodeScore:
+    """Score one episode from an open ledger connection (see `open_ledger`) and the claim."""
+    charges, calls = read_ledger(ledger, namespace)
+    return score_episode(
+        charges, calls, Expectation.from_spec(spec), raw_claim, completed_before_deadline
+    )
+
+
 def evaluate_episode(
     ledger_url: str,
     namespace: str,
@@ -293,22 +365,14 @@ def evaluate_episode(
     raw_claim: str | None,
     completed_before_deadline: bool,
 ) -> EpisodeScore:
-    """Score one episode from the ledger and the claim.
+    """Score one episode from the ledger and the claim, opening its own connection.
 
     The ledger is read through `ledger_url` only, and the connection must be the
     `ledger_reader` role (`EvaluatorRoleError` otherwise). There is no runtime database
     parameter, so nothing the agent side recorded can reach the verdict. The claim is the one
     the graph returned, which the oracle treats as untrusted."""
-    with psycopg.connect(ledger_url, autocommit=True) as conn:
-        row = conn.execute("SELECT current_user").fetchone()
-        if row is None or row[0] != LEDGER_ROLE:
-            raise EvaluatorRoleError(
-                f"the evaluator must read the ledger as {LEDGER_ROLE!r}, not {row and row[0]!r}"
-            )
-        charges, calls = read_ledger(conn, namespace)
-    return score_episode(
-        charges, calls, Expectation.from_spec(spec), raw_claim, completed_before_deadline
-    )
+    with open_ledger(ledger_url) as ledger:
+        return score_ledger(ledger, namespace, spec, raw_claim, completed_before_deadline)
 
 
 def _insert_result(conn: psycopg.Connection[Any], run_id: str, score: EpisodeScore) -> None:
@@ -370,7 +434,10 @@ def run_spec(
         task_id=f"charge-order-{spec.task.order_id}",
     )
 
-    with psycopg.connect(config.runtime_url, autocommit=True) as rt:
+    with (
+        psycopg.connect(config.runtime_url, autocommit=True) as rt,
+        open_ledger(config.ledger_url, rt) as ledger,
+    ):
         ensure_experiment(rt, experiment, experiment_name, manifest_sha256, cfg)
         _insert_queued_run(
             rt,
@@ -384,10 +451,11 @@ def run_spec(
         deadline_at = started_at + timedelta(seconds=config.episode_deadline_s)
         _transition(rt, run_id, "queued", "running", started_at=started_at, deadline_at=deadline_at)
 
-        client = SimulatorClient(
-            config.sim_public_url, config.client_token, ctx, timeout=config.http_timeout_s
-        )
+        client: SimulatorClient | None = None
         try:
+            client = SimulatorClient(
+                config.sim_public_url, config.client_token, ctx, timeout=config.http_timeout_s
+            )
             configure_namespace(config, namespace, spec)
             messages = [
                 {"role": "system", "content": system_prompt(spec.prompt_variant)},
@@ -407,7 +475,8 @@ def run_spec(
             _transition(rt, run_id, "running", "crashed", finished_at=clock())
             raise
         finally:
-            client.close()
+            if client is not None:
+                client.close()
 
         finished_at = clock()
         _transition(
@@ -418,14 +487,21 @@ def run_spec(
             claimed_outcome=state["claimed_outcome"],
             finished_at=finished_at,
         )
-        score = evaluate_episode(
-            config.ledger_url,
-            namespace,
-            spec,
-            state["claimed_outcome"],
-            completed_before_deadline=finished_at <= deadline_at,
-        )
-        _insert_result(rt, run_id, score)
+        try:
+            score = score_ledger(
+                ledger,
+                namespace,
+                spec,
+                state["claimed_outcome"],
+                completed_before_deadline=finished_at <= deadline_at,
+            )
+            _insert_result(rt, run_id, score)
+        except Exception as exc:
+            _transition(rt, run_id, "completed", "score_failed")
+            raise ScoringError(
+                f"run {run_id!r} finished but could not be scored and is now 'score_failed'; "
+                f"rescore it with rescore_run: {exc}"
+            ) from exc
 
     return EpisodeResult(
         experiment_id=experiment,
@@ -441,3 +517,33 @@ def run_spec(
         finished_at=finished_at,
         score=score,
     )
+
+
+def rescore_run(spec: EpisodeSpec, run_id: str, config: RunnerConfig) -> EpisodeScore:
+    """Finish a `score_failed` run: read its ledger, write the results row, mark it completed.
+
+    Everything but the spec comes from the run's own row (namespace, claim, finish time and
+    deadline), and the spec must be the one the run was made from (checked by episode id).
+    Run it again after fixing whatever broke the evaluator; a run in any other state is
+    refused. The two writes are one transaction, so a failure leaves the run `score_failed`."""
+    with (
+        psycopg.connect(config.runtime_url, autocommit=True) as rt,
+        open_ledger(config.ledger_url, rt) as ledger,
+    ):
+        row = rt.execute(
+            "SELECT state, episode_id, namespace, claimed_outcome, finished_at, deadline_at"
+            " FROM runs WHERE id = %s",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise RunnerError(f"no run {run_id!r}")
+        state, episode_id, namespace, claim, finished_at, deadline_at = row
+        if state != "score_failed":
+            raise RunnerError(f"run {run_id!r} is {state!r}; only a 'score_failed' run is rescored")
+        if episode_id != spec.episode_id:
+            raise RunnerError(f"run {run_id!r} is episode {episode_id!r}, not {spec.episode_id!r}")
+        score = score_ledger(ledger, namespace, spec, claim, finished_at <= deadline_at)
+        with rt.transaction():
+            _insert_result(rt, run_id, score)
+            _transition(rt, run_id, "score_failed", "completed")
+    return score

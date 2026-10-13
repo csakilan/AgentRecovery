@@ -22,15 +22,23 @@ client turning it into a retry, a bare `except OSError`) therefore still fails t
 the autouse fixture `fail_on_unacknowledged_network_attempts` checks the record after each
 test. A test that attempts a connection on purpose wraps it in `guard.expecting()`.
 
-Limits, stated so nobody over-trusts it: the guard lives inside this Python process. A child
-process (subprocess, the replay workers) is not covered, and neither is a C library that
-opens its own sockets, such as libpq. The tests in this suite start children only on
-loopback.
+Child processes. The guard lives inside one Python process, so a child that runs the graph
+(the replay workers, tests/agent/replay_worker.py) installs its own copy at start-up and
+passes it a `log_path`. Each refusal is appended to that file the instant it happens, so a
+worker that is later SIGKILLed, or whose code swallowed the error, still leaves the evidence;
+the parent reads the file with `read_log()` and fails. `LOG_ENV` names the variable a parent
+uses to hand the path to a child.
+
+Limits, stated so nobody over-trusts it: a C library that opens its own sockets, such as
+libpq, is not covered, and neither is a child process that does not install the guard. The
+tests in this suite start children only on loopback, and test_no_live_calls.py scans every
+file under tests/ so a child cannot name a provider quietly.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 import threading
 from collections.abc import Iterator
@@ -39,6 +47,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+
+# The hosts the suite must never reach: the model providers this project could use and
+# LangSmith's trace upload. One definition, used by the tests that probe the guard and by the
+# source scan that keeps these names out of everything else.
+PROVIDER_HOSTS = (
+    "openrouter.ai",
+    "api.anthropic.com",
+    "api.openai.com",
+    "api.smith.langchain.com",
+    "eu.api.smith.langchain.com",
+)
 
 _LOCAL_NAMES = {"localhost", "ip6-localhost", "localhost.localdomain"}
 
@@ -89,9 +108,24 @@ def is_loopback(host: Any) -> bool:
     return ip.is_loopback
 
 
+# The environment variable a parent sets to the file a child's guard should log refusals to.
+LOG_ENV = "LAB_NETWORK_GUARD_LOG"
+
+
+def read_log(path: str | os.PathLike[str]) -> list[str]:
+    """The refusals a child's guard logged, one "kind target" per line. A missing file is
+    an empty log: the guard only creates it on the first refusal."""
+    try:
+        with open(path) as fh:
+            return [line.rstrip("\n") for line in fh if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
 class NetworkGuard:
-    def __init__(self) -> None:
+    def __init__(self, log_path: str | os.PathLike[str] | None = None) -> None:
         self.blocked: list[Attempt] = []
+        self._log_path = log_path
         self._lock = threading.Lock()
         self._originals: dict[str, Any] = {}
 
@@ -104,6 +138,10 @@ class NetworkGuard:
     def _refuse(self, kind: str, target: str) -> NetworkBlocked:
         with self._lock:
             self.blocked.append(Attempt(kind, target))
+            if self._log_path is not None:
+                # Written and closed at once, so a SIGKILL one instruction later keeps it.
+                with open(self._log_path, "a") as fh:
+                    fh.write(f"{kind} {target}\n")
         return NetworkBlocked(f"test suite network guard: {kind} to {target} is not allowed")
 
     def unacknowledged(self, since: int = 0) -> list[Attempt]:

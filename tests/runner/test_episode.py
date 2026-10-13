@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -19,6 +20,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg.rows import dict_row
 
 import lab.runner.episode as episode_module
+from lab import db
 from lab.agent.model import ModelTurn, ToolCall
 from lab.agent.prompts import PROMPT_VERSION
 from lab.agent.scripted import SCRIPTED_POLICIES, ScriptedModel
@@ -32,14 +34,17 @@ from lab.runner.episode import (
     EpisodeAlreadyRunError,
     EvaluatorRoleError,
     ExperimentMismatchError,
+    LedgerConfigError,
     NamespaceConfigError,
     RunnerConfig,
+    ScoringError,
     UnsupportedModeError,
     configure_namespace,
     derive_experiment_id,
     evaluate_episode,
     experiment_config,
     new_namespace,
+    rescore_run,
     run_spec,
 )
 from tests.runner.conftest import EXPERIMENT_NAME_PREFIX
@@ -455,15 +460,238 @@ def test_the_verdict_follows_the_returned_claim_not_a_row_the_runtime_holds(
 ):
     # Rewrite runs.claimed_outcome in the runtime database just before scoring. The verdict
     # must still be the one for the claim the graph returned ("succeeded", a false success).
-    original = episode_module.evaluate_episode
+    original = episode_module.score_ledger
 
-    def tampering(ledger_url, namespace, spec, raw_claim, completed_before_deadline):
+    def tampering(ledger, namespace, spec, raw_claim, completed_before_deadline):
         rt.execute("UPDATE runs SET claimed_outcome = 'failed' WHERE namespace = %s", (namespace,))
-        return original(ledger_url, namespace, spec, raw_claim, completed_before_deadline)
+        return original(ledger, namespace, spec, raw_claim, completed_before_deadline)
 
-    monkeypatch.setattr(episode_module, "evaluate_episode", tampering)
+    monkeypatch.setattr(episode_module, "score_ledger", tampering)
     result = run("false_success", World.TRUE_FAIL, runner_config)
     assert result_row(rt, result.run_id)["verdict"] == "false_success"
+
+
+# ---------------------------------------------------------------------------
+# A misconfigured ledger URL is found before anything is spent or written
+# ---------------------------------------------------------------------------
+
+
+class CountingModel:
+    """A scripted model that counts how often it is asked, for the 'never called' checks."""
+
+    def __init__(self, policy: str = "stable_key"):
+        self.inner = ScriptedModel(policy)
+        self.model_id = self.inner.model_id
+        self.calls = 0
+
+    def complete(self, messages, tools):
+        self.calls += 1
+        return self.inner.complete(messages, tools)
+
+
+def with_ledger_url(config: RunnerConfig, url: str) -> RunnerConfig:
+    return RunnerConfig(**{**config.__dict__, "ledger_url": url})
+
+
+def assert_nothing_was_written(rt, model: CountingModel, spec) -> None:
+    assert model.calls == 0
+    assert rt.execute("SELECT 1 FROM experiments WHERE name = %s", (NAME,)).fetchone() is None
+    assert (
+        rt.execute("SELECT 1 FROM runs WHERE episode_id = %s", (spec.episode_id,)).fetchone()
+        is None
+    )
+
+
+def run_with_ledger(config: RunnerConfig, rt) -> tuple[CountingModel, Any]:
+    model = CountingModel()
+    spec = spec_for(World.LOST_ACK)
+    try:
+        run_spec(spec, model, config, manifest_sha256=SHA, experiment_name=NAME)
+    except Exception as exc:
+        return model, exc
+    raise AssertionError("run_spec accepted a misconfigured ledger URL")
+
+
+def test_the_payment_service_role_is_refused_before_the_episode_starts(
+    runner_config, payments_db, rt
+):
+    config = with_ledger_url(runner_config, payments_db["svc"])  # a real role, the wrong one
+    model, error = run_with_ledger(config, rt)
+    assert isinstance(error, EvaluatorRoleError)
+    assert "payment_svc" in str(error)
+    assert_nothing_was_written(rt, model, spec_for(World.LOST_ACK))
+
+
+def test_a_wrong_ledger_password_is_refused_before_the_episode_starts(
+    runner_config, payments_db, rt
+):
+    url = db.with_database(
+        payments_db["admin"], payments_db["name"], "ledger_reader", "not-the-password"
+    )
+    model, error = run_with_ledger(with_ledger_url(runner_config, url), rt)
+    assert isinstance(error, LedgerConfigError)
+    assert isinstance(error.__cause__, psycopg.OperationalError)
+    assert_nothing_was_written(rt, model, spec_for(World.LOST_ACK))
+
+
+def test_a_ledger_host_that_is_not_there_is_refused_before_the_episode_starts(
+    runner_config, payments_db, rt
+):
+    url = payments_db["reader"].replace("localhost:54329", "127.0.0.1:1")
+    assert url != payments_db["reader"]
+    model, error = run_with_ledger(with_ledger_url(runner_config, url), rt)
+    assert isinstance(error, LedgerConfigError)
+    assert_nothing_was_written(rt, model, spec_for(World.LOST_ACK))
+
+
+def test_a_database_without_the_ledger_tables_is_refused_before_the_episode_starts(
+    runner_config, rt, admin_url, role_url
+):
+    empty = f"empty_ledger_{uuid.uuid4().hex[:8]}"
+    db.ensure_database(admin_url, empty)
+    try:
+        url = role_url("ledger_reader", empty)
+        model, error = run_with_ledger(with_ledger_url(runner_config, url), rt)
+    finally:
+        db.drop_database(admin_url, empty)
+    assert isinstance(error, LedgerConfigError)
+    assert "charges" in str(error)
+    assert_nothing_was_written(rt, model, spec_for(World.LOST_ACK))
+
+
+def test_a_ledger_url_that_points_at_the_runtime_database_is_refused(
+    runner_config, runtime_db, rt, role_url
+):
+    # By design ledger_reader cannot connect to the runtime database (CONNECT is revoked from
+    # PUBLIC). Grant it, as a mistaken operator might, so the check after the role check is
+    # what stops the run.
+    grant = f'GRANT CONNECT ON DATABASE "{runtime_db["name"]}" TO ledger_reader'
+    revoke = f'REVOKE CONNECT ON DATABASE "{runtime_db["name"]}" FROM ledger_reader'
+    url = role_url("ledger_reader", runtime_db["name"])
+    with psycopg.connect(runtime_db["admin"], autocommit=True) as admin:
+        admin.execute(grant)
+        try:
+            model, error = run_with_ledger(with_ledger_url(runner_config, url), rt)
+        finally:
+            admin.execute(revoke)
+    assert isinstance(error, LedgerConfigError)
+    assert not isinstance(error, EvaluatorRoleError)
+    assert "runtime database" in str(error)
+    assert_nothing_was_written(rt, model, spec_for(World.LOST_ACK))
+
+
+# ---------------------------------------------------------------------------
+# A scoring failure after the episode is recorded, and can be repaired
+# ---------------------------------------------------------------------------
+
+
+class LedgerKiller:
+    """A scripted model that, on its first call, terminates the evaluator's ledger session
+    from outside: a real failure of the connection the runner opened before the episode."""
+
+    def __init__(self, admin_url: str, application_name: str):
+        self.inner = ScriptedModel("stable_key")
+        self.model_id = self.inner.model_id
+        self._admin_url = admin_url
+        self._application_name = application_name
+        self.killed = 0
+
+    def complete(self, messages, tools):
+        if not self.killed:
+            with psycopg.connect(self._admin_url, autocommit=True) as admin:
+                rows = admin.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                    " WHERE application_name = %s",
+                    (self._application_name,),
+                ).fetchall()
+            self.killed = len(rows)
+            assert self.killed == 1, "the ledger session was not found"
+        return self.inner.complete(messages, tools)
+
+
+def test_a_scoring_failure_leaves_a_score_failed_run_that_rescore_run_finishes(
+    runner_config, payments_db, rt
+):
+    app = f"ledger-kill-{uuid.uuid4().hex[:8]}"
+    config = with_ledger_url(runner_config, payments_db["reader"] + f"?application_name={app}")
+    spec = spec_for(World.LOST_ACK)
+    model = LedgerKiller(payments_db["admin"], app)
+
+    with pytest.raises(ScoringError, match="score_failed") as raised:
+        run_spec(spec, model, config, manifest_sha256=SHA, experiment_name=NAME)
+    assert isinstance(raised.value.__cause__, psycopg.OperationalError)
+    assert model.killed == 1
+
+    # Not a bare 'completed': a state of its own, with the agent's side of the record intact
+    # and no results row.
+    row = one(rt, "SELECT * FROM runs WHERE episode_id = %s", spec.episode_id)
+    assert row["state"] == "score_failed"
+    assert row["claimed_outcome"] == "succeeded"
+    assert row["finished_at"] is not None
+    assert rt.execute("SELECT 1 FROM results WHERE run_id = %s", (row["id"],)).fetchone() is None
+
+    # The same episode cannot be run again in this experiment ...
+    with pytest.raises(EpisodeAlreadyRunError):
+        run_spec(
+            spec,
+            ScriptedModel("stable_key"),
+            runner_config,
+            manifest_sha256=SHA,
+            experiment_name=NAME,
+        )
+
+    # ... but its ledger can be scored, once the evaluator works again.
+    score = rescore_run(spec, row["id"], runner_config)
+    assert score.verdict is Verdict.CORRECT
+    after = one(rt, "SELECT state FROM runs WHERE id = %s", row["id"])
+    assert after["state"] == "completed"
+    stored = result_row(rt, row["id"])
+    assert stored["verdict"] == "correct"
+    assert stored["score_json"]["completed_before_deadline"] is True
+    assert stored["evaluator_version"] == EVALUATOR_VERSION
+
+    # A run that is not score_failed is not rescored, and neither is another episode's.
+    with pytest.raises(episode_module.RunnerError, match="completed"):
+        rescore_run(spec, row["id"], runner_config)
+
+
+def test_rescore_run_refuses_a_spec_of_another_episode(runner_config, rt, payments_db):
+    app = f"ledger-kill-{uuid.uuid4().hex[:8]}"
+    config = with_ledger_url(runner_config, payments_db["reader"] + f"?application_name={app}")
+    spec = spec_for(World.LOST_ACK)
+    with pytest.raises(ScoringError):
+        run_spec(
+            spec,
+            LedgerKiller(payments_db["admin"], app),
+            config,
+            manifest_sha256=SHA,
+            experiment_name=NAME,
+        )
+    run_id = one(rt, "SELECT id FROM runs WHERE episode_id = %s", spec.episode_id)["id"]
+    with pytest.raises(episode_module.RunnerError, match="not"):
+        rescore_run(spec_for(World.TRUE_FAIL, rep=9), run_id, runner_config)
+    assert one(rt, "SELECT state FROM runs WHERE id = %s", run_id)["state"] == "score_failed"
+
+
+def test_a_client_that_cannot_be_built_crashes_the_run_instead_of_leaving_it_running(
+    runner_config, rt, monkeypatch
+):
+    def broken(*args, **kwargs):
+        raise RuntimeError("cannot build the client")
+
+    monkeypatch.setattr(episode_module, "SimulatorClient", broken)
+    spec = spec_for(World.LOST_ACK)
+    with pytest.raises(RuntimeError, match="cannot build"):
+        run_spec(
+            spec,
+            ScriptedModel("stable_key"),
+            runner_config,
+            manifest_sha256=SHA,
+            experiment_name=NAME,
+        )
+    row = one(rt, "SELECT state, finished_at FROM runs WHERE episode_id = %s", spec.episode_id)
+    assert row["state"] == "crashed"
+    assert row["finished_at"] is not None
 
 
 # ---------------------------------------------------------------------------

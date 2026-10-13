@@ -31,24 +31,46 @@ Configuration: the connection details come from the environment, so no password 
 command line (LAB_REPLAY_RUNTIME_URL is a runtime_svc URL, LAB_REPLAY_SIM_URL the public
 simulator URL, LAB_REPLAY_CLIENT_TOKEN its bearer token). Everything else is argv.
 
+Network guard. The worker installs tests/network_guard.py before anything else. Every refused
+connection is appended to the file named by LAB_NETWORK_GUARD_LOG at once (so a worker that is
+SIGKILLed still leaves it), and a worker that finishes with any refusal exits 6 and lists them
+on stderr. The orchestrator fails the test on a non-empty log, whatever the exit code.
+`--probe-host HOST` is the test of that: the first model call tries to connect to HOST and
+swallows the error, as a retrying HTTP client would.
+
 Exit codes: 0 finished (stdout has {"ok": true, "state": ...}); 3 the resume was refused
 (stdout has {"ok": false, "error": ...}); 4 a hook was never killed; 5 the orchestrator
-went away while a hook was blocking. 4 and 5 leave through os._exit, so no LangGraph exit
-path runs and the database is left as a crash would leave it.
+went away while a hook was blocking; 6 the guard refused a network attempt. 4 and 5 leave
+through os._exit, so no LangGraph exit path runs and the database is left as a crash would
+leave it.
 """
 
 from __future__ import annotations
 
 import os
 import signal
+import sys
+from pathlib import Path
+
+# The suite's own guard, installed before anything else runs: this process builds and runs
+# the whole graph with a model chosen here, so it must not be able to leave the machine
+# either. `tests` is importable as a package from the repository root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tests.network_guard import LOG_ENV, NetworkGuard  # noqa: E402
+
+GUARD = NetworkGuard(log_path=os.environ.get(LOG_ENV))
+GUARD.install()
 
 # Before anything imports langchain/langsmith: no trace of an episode may leave the machine.
-os.environ["LANGSMITH_TRACING"] = "false"
-os.environ["LANGCHAIN_TRACING_V2"] = "false"
+# The same function the runner uses, so the variable list lives in one place.
+from lab.runner.tracing import force_tracing_off  # noqa: E402
+
+force_tracing_off()
 
 import argparse  # noqa: E402
 import json  # noqa: E402
-import sys  # noqa: E402
+import socket  # noqa: E402
 import time  # noqa: E402
 from typing import Any  # noqa: E402
 
@@ -78,6 +100,7 @@ BLOCK_LIMIT_S = 120.0
 EXIT_RESUME_REFUSED = 3
 EXIT_NOT_KILLED = 4
 EXIT_ORPHANED = 5
+EXIT_NETWORK_ATTEMPT = 6
 
 
 class KillPoint:
@@ -146,6 +169,26 @@ class KillAtSecondModelCall:
         return self._inner.complete(messages, tools)
 
 
+class ProbeNetworkOnFirstCall:
+    """Model wrapper: the first model call tries to connect to `host` and ignores the failure.
+    Only the guard's log can tell that it happened."""
+
+    def __init__(self, inner: ScriptedModel, host: str) -> None:
+        self._inner = inner
+        self._host = host
+        self._probed = False
+        self.model_id = inner.model_id
+
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
+        if not self._probed:
+            self._probed = True
+            try:
+                socket.create_connection((self._host, 443), timeout=1)
+            except OSError:
+                pass
+        return self._inner.complete(messages, tools)
+
+
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--namespace", required=True)
@@ -155,6 +198,7 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--kill-point", choices=KILL_POINTS, default="none")
     parser.add_argument("--durability", default="sync")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--probe-host", help="test hook: try to connect to this host once")
     return parser.parse_args(argv)
 
 
@@ -194,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.kill_point == "after_tool_step_immediate":
                 model = KillAtSecondModelCall(model)
+            if args.probe_host:
+                model = ProbeNetworkOnFirstCall(model, args.probe_host)
             graph = build_graph(
                 model,
                 executor,
@@ -221,5 +267,15 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _run() -> int:
+    code = main()
+    if GUARD.blocked:
+        sys.stderr.write(
+            "network guard refused: " + "; ".join(str(a) for a in GUARD.blocked) + "\n"
+        )
+        return code or EXIT_NETWORK_ATTEMPT
+    return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run())
