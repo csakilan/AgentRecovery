@@ -1,12 +1,31 @@
 import os
 import uuid
 
-import psycopg
-import pytest
-from psycopg.rows import dict_row
+# Before any test module imports langgraph or langsmith: no episode state may be uploaded to
+# LangSmith, whatever the shell has set. Set here directly (not through lab.runner) so the
+# test session is safe even if the runner's own guard were removed; test_no_live_calls.py
+# checks both.
+for _tracing_variable in (
+    "LANGSMITH_TRACING",
+    "LANGSMITH_TRACING_V2",
+    "LANGCHAIN_TRACING",
+    "LANGCHAIN_TRACING_V2",
+):
+    os.environ[_tracing_variable] = "false"
 
-from lab import db
-from lab.simulator import SIM_MIGRATIONS
+import psycopg  # noqa: E402
+import pytest  # noqa: E402
+from psycopg.rows import dict_row  # noqa: E402
+
+from lab import db  # noqa: E402
+from lab.simulator import SIM_MIGRATIONS  # noqa: E402
+
+# The session-wide network guard and the fixture that fails a test which tripped it. Both
+# are autouse; see tests/network_guard.py.
+from tests.network_guard import (  # noqa: E402, F401
+    fail_on_unacknowledged_network_attempts,
+    network_guard,
+)
 
 ADMIN_URL = os.environ.get(
     "LAB_PG_ADMIN_URL", "postgresql://postgres:postgres@localhost:54329/postgres"
