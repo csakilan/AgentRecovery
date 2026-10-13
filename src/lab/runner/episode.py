@@ -23,10 +23,21 @@ generated per run, and the episode id and task id come from the spec. They are p
 `TrustedContext`, which the simulator client reads once, and nothing in it is read back from
 a model message.
 
-The evaluator is kept apart from the agent's records on purpose. `open_ledger` connects with
-the `ledger_reader` URL (and refuses any other role), and scoring's only other inputs are the
-spec, the namespace and the claim the graph returned. It never queries the
-runtime database, so a verdict cannot be influenced by rows the agent side wrote.
+Evaluator and runner are kept apart, and the split is the constraint "the evaluator reads the
+payment ledger through `ledger_reader` and never reads the runtime database to decide a
+verdict".
+
+* The evaluator is `open_ledger`, `score_ledger` and `evaluate_episode` here, with the oracle
+  (`lab.oracle`) underneath. Their inputs are a ledger connection (or URL) and explicit
+  values: the spec, the namespace, the claim and `completed_before_deadline`. None has a
+  runtime parameter, and none touches the runtime database or imports a runtime module
+  (tests/runner/test_episode.py checks signatures, identifiers and imports).
+* The runner is everything around it. It owns the run record (the `runs` row) and decides
+  what to hand the evaluator. `run_spec` hands it the claim and the finish time it has in
+  memory from the graph's return value. `rescore_run` has no memory of the episode, so it
+  hands the evaluator the same two facts as the runner recorded them on the `runs` row. It
+  reads that row's runner-written columns only, never `model_calls`, `tool_events`,
+  `crash_points` or the checkpoint tables, which are the agent's own logs.
 
 The checkpointer is a `PostgresSaver` as `runtime_svc`. The runner never calls `setup()`:
 the checkpoint tables are created by `python -m lab.runtime migrate`.
@@ -307,15 +318,13 @@ LEDGER_TABLES = ("charges", "call_log")
 
 
 @contextmanager
-def open_ledger(
-    ledger_url: str, runtime_conn: psycopg.Connection[Any] | None = None
-) -> Iterator[psycopg.Connection[Any]]:
+def open_ledger(ledger_url: str) -> Iterator[psycopg.Connection[Any]]:
     """Connect to the ledger as the evaluator and check the connection is the right one.
 
     Checked before the connection is returned: it opens; the user is `ledger_reader`
-    (`EvaluatorRoleError` otherwise); the database is not the runtime database `runtime_conn`
-    is on, so the evaluator cannot be pointed at the agent's own records; and the ledger tables
-    can be read. Anything wrong is a `LedgerConfigError`."""
+    (`EvaluatorRoleError` otherwise); and the ledger tables can be read. Anything wrong is a
+    `LedgerConfigError`. This is evaluator code: it knows nothing of the runtime database
+    (the runner checks the two are different databases, in `check_ledger_is_not_runtime`)."""
     try:
         conn = psycopg.connect(ledger_url, autocommit=True)
     except psycopg.OperationalError as exc:
@@ -326,12 +335,6 @@ def open_ledger(
             raise EvaluatorRoleError(
                 f"the evaluator must read the ledger as {LEDGER_ROLE!r}, not {user!r}"
             )
-        if runtime_conn is not None:
-            runtime_db = runtime_conn.execute("SELECT current_database()").fetchone()[0]
-            if dbname == runtime_db:
-                raise LedgerConfigError(
-                    f"the ledger URL points at the runtime database {runtime_db!r}"
-                )
         for table in LEDGER_TABLES:
             try:
                 conn.execute(f"SELECT 1 FROM {table} LIMIT 0")
@@ -342,6 +345,19 @@ def open_ledger(
         yield conn
     finally:
         conn.close()
+
+
+def check_ledger_is_not_runtime(
+    ledger: psycopg.Connection[Any], runtime: psycopg.Connection[Any]
+) -> None:
+    """Runner-side check that the ledger URL does not point at the agent's own database.
+
+    It compares two database names and reads nothing else. It lives here, not in
+    `open_ledger`, so that the evaluator code has no use for a runtime connection."""
+    ledger_db = ledger.execute("SELECT current_database()").fetchone()[0]
+    runtime_db = runtime.execute("SELECT current_database()").fetchone()[0]
+    if ledger_db == runtime_db:
+        raise LedgerConfigError(f"the ledger URL points at the runtime database {runtime_db!r}")
 
 
 def score_ledger(
@@ -436,8 +452,9 @@ def run_spec(
 
     with (
         psycopg.connect(config.runtime_url, autocommit=True) as rt,
-        open_ledger(config.ledger_url, rt) as ledger,
+        open_ledger(config.ledger_url) as ledger,
     ):
+        check_ledger_is_not_runtime(ledger, rt)
         ensure_experiment(rt, experiment, experiment_name, manifest_sha256, cfg)
         _insert_queued_run(
             rt,
@@ -519,30 +536,70 @@ def run_spec(
     )
 
 
-def rescore_run(spec: EpisodeSpec, run_id: str, config: RunnerConfig) -> EpisodeScore:
-    """Finish a `score_failed` run: read its ledger, write the results row, mark it completed.
+@dataclass(frozen=True)
+class RunRecord:
+    """What the runner wrote about one run, read back from its `runs` row."""
 
-    Everything but the spec comes from the run's own row (namespace, claim, finish time and
-    deadline), and the spec must be the one the run was made from (checked by episode id).
-    Run it again after fixing whatever broke the evaluator; a run in any other state is
-    refused. The two writes are one transaction, so a failure leaves the run `score_failed`."""
+    state: str
+    episode_id: str
+    namespace: str
+    claimed_outcome: str | None
+    finished_at: datetime
+    deadline_at: datetime
+
+
+def load_run_record(rt: psycopg.Connection[Any], run_id: str) -> RunRecord:
+    """Read the runner-written columns of one `runs` row, and nothing else.
+
+    These are the values `run_spec` wrote from the graph's return value and its own clock
+    (`claimed_outcome`, `finished_at`, `deadline_at`) and from its own generation
+    (`namespace`, `episode_id`). It must not grow a query on `model_calls`, `tool_events`,
+    `crash_points` or the checkpoint tables: those are the agent's logs."""
+    row = rt.execute(
+        "SELECT state, episode_id, namespace, claimed_outcome, finished_at, deadline_at"
+        " FROM runs WHERE id = %s",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise RunnerError(f"no run {run_id!r}")
+    return RunRecord(*row)
+
+
+def rescore_run(spec: EpisodeSpec, run_id: str, config: RunnerConfig) -> EpisodeScore:
+    """Finish a `score_failed` run: score its ledger, write the results row, mark it completed.
+
+    This is runner code, not the evaluator. The episode's claim and finish time were in
+    memory when `run_spec` scored the run; here they are gone, so they are read from the
+    runner's own run record (`load_run_record`: the `runs` row the runner wrote from the
+    graph's return value and its clock). That is the same claim and the same
+    `finished_at <= deadline_at` the normal path hands the evaluator, so the verdict is the
+    one the normal path would have produced. The agent's tool and model logs are never read.
+    The evaluator (`score_ledger`) then gets them as plain arguments, like any other caller.
+
+    The spec must be the one the run was made from (checked by episode id), and a run in any
+    state but `score_failed` is refused. Run it again after fixing whatever broke the
+    evaluator. The two writes are one transaction, so a failure leaves the run `score_failed`."""
     with (
         psycopg.connect(config.runtime_url, autocommit=True) as rt,
-        open_ledger(config.ledger_url, rt) as ledger,
+        open_ledger(config.ledger_url) as ledger,
     ):
-        row = rt.execute(
-            "SELECT state, episode_id, namespace, claimed_outcome, finished_at, deadline_at"
-            " FROM runs WHERE id = %s",
-            (run_id,),
-        ).fetchone()
-        if row is None:
-            raise RunnerError(f"no run {run_id!r}")
-        state, episode_id, namespace, claim, finished_at, deadline_at = row
-        if state != "score_failed":
-            raise RunnerError(f"run {run_id!r} is {state!r}; only a 'score_failed' run is rescored")
-        if episode_id != spec.episode_id:
-            raise RunnerError(f"run {run_id!r} is episode {episode_id!r}, not {spec.episode_id!r}")
-        score = score_ledger(ledger, namespace, spec, claim, finished_at <= deadline_at)
+        check_ledger_is_not_runtime(ledger, rt)
+        record = load_run_record(rt, run_id)
+        if record.state != "score_failed":
+            raise RunnerError(
+                f"run {run_id!r} is {record.state!r}; only a 'score_failed' run is rescored"
+            )
+        if record.episode_id != spec.episode_id:
+            raise RunnerError(
+                f"run {run_id!r} is episode {record.episode_id!r}, not {spec.episode_id!r}"
+            )
+        score = score_ledger(
+            ledger,
+            record.namespace,
+            spec,
+            record.claimed_outcome,
+            record.finished_at <= record.deadline_at,
+        )
         with rt.transaction():
             _insert_result(rt, run_id, score)
             _transition(rt, run_id, "score_failed", "completed")

@@ -8,16 +8,21 @@ object `run_spec` returns. The model is always a scripted one, so nothing here c
 
 from __future__ import annotations
 
+import ast
+import dataclasses
+import inspect
 import json
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import psycopg
 import pytest
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 import lab.runner.episode as episode_module
 from lab import db
@@ -448,11 +453,82 @@ def test_evaluate_episode_refuses_any_other_role(runner_config, payments_db):
         evaluate_episode(payments_db["svc"], "some-namespace", spec, "succeeded", True)
 
 
-def test_evaluate_episode_takes_no_runtime_connection():
-    import inspect
+EVALUATOR_FUNCTIONS = ("open_ledger", "score_ledger", "evaluate_episode")
 
-    params = set(inspect.signature(evaluate_episode).parameters)
-    assert params == {"ledger_url", "namespace", "spec", "raw_claim", "completed_before_deadline"}
+
+def _function_nodes(names):
+    tree = ast.parse(inspect.getsource(episode_module))
+    return [
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+
+
+def test_the_evaluator_entry_points_have_no_way_to_reach_the_runtime_database():
+    # Signatures: ledger connection or URL plus explicit values, nothing from the runtime side.
+    assert list(inspect.signature(episode_module.open_ledger).parameters) == ["ledger_url"]
+    assert list(inspect.signature(episode_module.score_ledger).parameters) == [
+        "ledger",
+        "namespace",
+        "spec",
+        "raw_claim",
+        "completed_before_deadline",
+    ]
+    assert list(inspect.signature(evaluate_episode).parameters) == [
+        "ledger_url",
+        "namespace",
+        "spec",
+        "raw_claim",
+        "completed_before_deadline",
+    ]
+    # Bodies: no identifier or attribute that names the runtime side (docstrings and string
+    # literals are not identifiers, so a docstring may still explain the rule).
+    nodes = _function_nodes(EVALUATOR_FUNCTIONS)
+    assert len(nodes) == len(EVALUATOR_FUNCTIONS)
+    for node in nodes:
+        identifiers = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} | {
+            n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)
+        }
+        identifiers |= {a.arg for a in ast.walk(node) if isinstance(a, ast.arg)}
+        assert not {i for i in identifiers if "runtime" in i.lower() or i in ("rt", "config")}, (
+            node.name,
+            identifiers,
+        )
+
+
+def test_the_oracle_imports_nothing_from_the_runtime_or_the_runner():
+    root = Path(episode_module.__file__).parents[1] / "oracle"
+    files = sorted(root.glob("*.py"))
+    assert {f.name for f in files} >= {"ledger.py", "score.py"}
+    for path in files:
+        for node in ast.walk(ast.parse(path.read_text())):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            for name in names:
+                assert not name.startswith(("lab.runtime", "lab.runner", "lab.agent")), (
+                    path.name,
+                    name,
+                )
+
+
+def test_the_rescore_path_names_only_the_runner_tables():
+    # The runner may read its own run record, never the agent's logs. Every SQL string on the
+    # rescore path must name only `runs` and `results`.
+    nodes = _function_nodes(("rescore_run", "load_run_record", "_insert_result", "_transition"))
+    assert len(nodes) == 4
+    tables: set[str] = set()
+    for node in nodes:
+        docstring = ast.get_docstring(node, clean=False)
+        for const in ast.walk(node):
+            if isinstance(const, ast.Constant) and isinstance(const.value, str):
+                if const.value == docstring:
+                    continue
+                tables |= set(
+                    re.findall(r"\b(?:FROM|INTO|UPDATE|JOIN)\s+(\w+)", const.value, re.IGNORECASE)
+                )
+    assert tables == {"runs", "results"}
 
 
 def test_the_verdict_follows_the_returned_claim_not_a_row_the_runtime_holds(
@@ -563,17 +639,19 @@ def test_a_ledger_url_that_points_at_the_runtime_database_is_refused(
     runner_config, runtime_db, rt, role_url
 ):
     # By design ledger_reader cannot connect to the runtime database (CONNECT is revoked from
-    # PUBLIC). Grant it, as a mistaken operator might, so the check after the role check is
-    # what stops the run.
-    grant = f'GRANT CONNECT ON DATABASE "{runtime_db["name"]}" TO ledger_reader'
-    revoke = f'REVOKE CONNECT ON DATABASE "{runtime_db["name"]}" FROM ledger_reader'
+    # PUBLIC) and the runtime database has no ledger tables. Undo both, as one database made
+    # to serve as both would be, so the runner's own check is what stops the run.
     url = role_url("ledger_reader", runtime_db["name"])
     with psycopg.connect(runtime_db["admin"], autocommit=True) as admin:
-        admin.execute(grant)
+        admin.execute(f'GRANT CONNECT ON DATABASE "{runtime_db["name"]}" TO ledger_reader')
+        admin.execute("CREATE TABLE charges (id int)")
+        admin.execute("CREATE TABLE call_log (id int)")
+        admin.execute("GRANT SELECT ON charges, call_log TO ledger_reader")
         try:
             model, error = run_with_ledger(with_ledger_url(runner_config, url), rt)
         finally:
-            admin.execute(revoke)
+            admin.execute("DROP TABLE charges, call_log")
+            admin.execute(f'REVOKE CONNECT ON DATABASE "{runtime_db["name"]}" FROM ledger_reader')
     assert isinstance(error, LedgerConfigError)
     assert not isinstance(error, EvaluatorRoleError)
     assert "runtime database" in str(error)
@@ -653,6 +731,115 @@ def test_a_scoring_failure_leaves_a_score_failed_run_that_rescore_run_finishes(
     # A run that is not score_failed is not rescored, and neither is another episode's.
     with pytest.raises(episode_module.RunnerError, match="completed"):
         rescore_run(spec, row["id"], runner_config)
+
+
+def _score_failed_run(config, payments_db, rt, spec):
+    app = f"ledger-kill-{uuid.uuid4().hex[:8]}"
+    broken = with_ledger_url(config, payments_db["reader"] + f"?application_name={app}")
+    with pytest.raises(ScoringError):
+        run_spec(
+            spec,
+            LedgerKiller(payments_db["admin"], app),
+            broken,
+            manifest_sha256=SHA,
+            experiment_name=NAME,
+        )
+    return one(rt, "SELECT * FROM runs WHERE episode_id = %s", spec.episode_id)
+
+
+def test_rescore_ignores_the_agents_logs_and_matches_the_normal_path(
+    runner_config, payments_db, rt
+):
+    spec = spec_for(World.LOST_ACK)
+    row = _score_failed_run(runner_config, payments_db, rt, spec)
+    assert row["claimed_outcome"] == "succeeded"
+
+    # What the normal path would have produced for this very run: the evaluator, handed the
+    # claim and the deadline comparison the runner had in memory.
+    expected = evaluate_episode(
+        runner_config.ledger_url,
+        row["namespace"],
+        spec,
+        "succeeded",
+        row["finished_at"] <= row["deadline_at"],
+    )
+
+    # Tamper with everything the agent side logged: a report_done event and a model call that
+    # say the episode failed. A rescore that read them would return a different verdict.
+    rt.execute(
+        "INSERT INTO tool_events (run_id, turn, tool, requested_args_json, rule, observation)"
+        " VALUES (%s, 99, 'report_done', %s, 'report_done', 'Recorded.')",
+        (row["id"], Jsonb({"outcome": "failed"})),
+    )
+    rt.execute(
+        "INSERT INTO model_calls (run_id, turn, provider_model_id, request_json, response_json,"
+        " tool_calls_json) VALUES (%s, 99, 'tampered', '{}', %s, %s)",
+        (
+            row["id"],
+            Jsonb({"claim": "failed"}),
+            Jsonb([{"name": "report_done", "arguments": {"outcome": "failed"}}]),
+        ),
+    )
+    rt.execute(
+        "UPDATE tool_events SET requested_args_json = %s WHERE run_id = %s AND tool = 'report_done'"
+        " AND turn <> 99",
+        (Jsonb({"outcome": "failed"}), row["id"]),
+    )
+
+    score = rescore_run(spec, row["id"], runner_config)
+
+    assert score == expected
+    assert score.verdict is Verdict.CORRECT
+    stored = result_row(rt, row["id"])
+    assert stored["verdict"] == "correct"
+    assert stored["score_json"] == json.loads(json.dumps(dataclasses.asdict(expected)))
+
+    # And it is the verdict an untampered normal run of the same episode earns.
+    normal = run("stable_key", World.LOST_ACK, runner_config, experiment_id="exp-normal-path")
+    assert normal.score.verdict is score.verdict
+
+
+def test_rescore_reads_only_the_run_record_from_the_runtime_database(
+    runner_config, payments_db, rt, monkeypatch
+):
+    spec = spec_for(World.LOST_ACK)
+    row = _score_failed_run(runner_config, payments_db, rt, spec)
+
+    queries: list[tuple[str, str]] = []
+
+    class LoggingCursor(psycopg.Cursor):
+        def execute(self, query, *args, **kwargs):
+            queries.append(
+                (
+                    self.connection.info.user,
+                    str(getattr(query, "as_string", lambda _: query)(self.connection))
+                    if not isinstance(query, str)
+                    else query,
+                )
+            )
+            return super().execute(query, *args, **kwargs)
+
+    real_connect = psycopg.connect
+
+    def logging_connect(*args, **kwargs):
+        return real_connect(*args, cursor_factory=LoggingCursor, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(psycopg, "connect", logging_connect)
+        rescore_run(spec, row["id"], runner_config)
+
+    def tables(user):
+        found: set[str] = set()
+        for who, query in queries:
+            if who == user:
+                found |= set(
+                    re.findall(r"\b(?:FROM|INTO|UPDATE|JOIN)\s+(\w+)", query, re.IGNORECASE)
+                )
+        return found
+
+    assert queries, "the spy saw no queries, so it proves nothing"
+    assert tables("runtime_svc") == {"runs", "results"}
+    assert tables("ledger_reader") == {"charges", "call_log"}
 
 
 def test_rescore_run_refuses_a_spec_of_another_episode(runner_config, rt, payments_db):
