@@ -253,17 +253,20 @@ def test_force_tracing_off_overrides_whatever_the_shell_set(monkeypatch):
 
 def test_importing_the_runner_turns_tracing_off_in_a_fresh_process():
     env = {**os.environ, **dict.fromkeys(TRACING_VARIABLES, "true")}
+    # Print only the LangSmith switches this module owns. Other variables whose names happen
+    # to contain TRACING (GitHub Actions sets one) are not part of the property.
     code = (
         "import os, lab.runner.episode;"
         "from langsmith.utils import tracing_is_enabled;"
-        "print([os.environ[n] for n in sorted(os.environ) if 'TRACING' in n],"
+        f"print([os.environ.get(n) for n in {tuple(TRACING_VARIABLES)!r}],"
         " tracing_is_enabled())"
     )
     done = subprocess.run(
         [sys.executable, "-c", code], cwd=REPO, env=env, capture_output=True, text=True, timeout=120
     )
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip() == "['false', 'false', 'false', 'false'] False"
+    expected = f"{['false'] * len(TRACING_VARIABLES)} False"
+    assert done.stdout.strip() == expected
 
 
 # ---------------------------------------------------------------------------
