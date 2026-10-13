@@ -1,0 +1,116 @@
+"""Run one scripted episode from the command line.
+
+    python -m lab.runner run --policy stable_key --world lost_ack
+    python -m lab.runner run --policy give_up --manifest m.json --episode "behavior/lost_ack/..."
+
+Plan 2 has no path to a real model: `--policy` is required and names one of the scripted
+policies in `lab.agent.scripted`. Without `--manifest` the episode is built with `make_spec`
+(controlled profile, `agent_directed`, status tool on unless `--no-status`). With it, the
+named episode is read from the manifest file. Connection details come from the environment
+of `.env.example` (see `RunnerConfig.from_env`).
+
+Prints one JSON line: the ids, the claim and the verdict the oracle wrote to `results`.
+Exit status 0 on a completed episode, 2 on a refusal (bad arguments, an unsupported mode,
+missing configuration).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+from lab.runner.tracing import force_tracing_off
+
+force_tracing_off()
+
+from lab.agent.scripted import SCRIPTED_POLICIES, ScriptedModel  # noqa: E402
+from lab.protocol.faults import World  # noqa: E402
+from lab.protocol.manifest import EpisodeSpec, Manifest, Mode, make_spec  # noqa: E402
+from lab.protocol.task import Profile  # noqa: E402
+from lab.runner.episode import (  # noqa: E402
+    EpisodeResult,
+    RunnerConfig,
+    RunnerError,
+    run_spec,
+)
+
+
+def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="python -m lab.runner", description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    run = commands.add_parser("run", help="run one scripted episode")
+    run.add_argument("--policy", required=True, choices=SCRIPTED_POLICIES)
+    run.add_argument("--world", type=World, choices=list(World), default=World.LOST_ACK)
+    run.add_argument("--status", action=argparse.BooleanOptionalAction, default=True)
+    run.add_argument("--rep", type=int, default=0, help="repetition number for make_spec")
+    run.add_argument("--manifest", type=Path, help="read the episode from this manifest file")
+    run.add_argument("--episode", help="episode id inside --manifest")
+    run.add_argument("--max-turns", type=int, help="override RunnerConfig.max_turns")
+    run.add_argument("--deadline-s", type=float, help="override RunnerConfig.episode_deadline_s")
+    return parser.parse_args(argv)
+
+
+def _spec_and_manifest(args: argparse.Namespace) -> tuple[EpisodeSpec, str, str]:
+    """The spec to run, the manifest hash and the experiment name."""
+    if args.manifest is None:
+        if args.episode is not None:
+            raise RunnerError("--episode needs --manifest")
+        spec = make_spec("cli", args.world, Mode.AGENT_DIRECTED, args.status, args.rep)
+        manifest = Manifest(name="cli", seed=0, episodes=(spec,))
+        return spec, manifest.sha256(), manifest.name
+    if args.episode is None:
+        raise RunnerError("--manifest needs --episode")
+    manifest = Manifest.load(args.manifest)
+    by_id = {episode.episode_id: episode for episode in manifest.episodes}
+    if args.episode not in by_id:
+        raise RunnerError(f"episode {args.episode!r} is not in {args.manifest}")
+    return by_id[args.episode], manifest.sha256(), manifest.name
+
+
+def _summary(result: EpisodeResult) -> dict[str, object]:
+    return {
+        "experiment_id": result.experiment_id,
+        "run_id": result.run_id,
+        "episode_id": result.episode_id,
+        "namespace": result.namespace,
+        "claimed_outcome": result.claimed_outcome,
+        "ended_by": result.ended_by,
+        "verdict": result.score.verdict.value,
+        "correct_recovery": result.score.correct_recovery,
+    }
+
+
+def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None) -> int:
+    args = _parse(argv)
+    try:
+        spec, manifest_sha256, name = _spec_and_manifest(args)
+        if spec.profile is not Profile.CONTROLLED:
+            # The scripted policies send the controlled profile's argument set (scripted.py).
+            raise RunnerError(
+                f"scripted policies only run the controlled profile, not {spec.profile}"
+            )
+        overrides = {}
+        if args.max_turns is not None:
+            overrides["max_turns"] = args.max_turns
+        if args.deadline_s is not None:
+            overrides["episode_deadline_s"] = args.deadline_s
+        config = RunnerConfig.from_env(environ, **overrides)
+        result = run_spec(
+            spec,
+            ScriptedModel(args.policy),
+            config,
+            manifest_sha256=manifest_sha256,
+            experiment_name=name,
+        )
+    except RunnerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(_summary(result)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
