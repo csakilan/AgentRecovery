@@ -7,7 +7,8 @@ Plan 2 has no path to a real model: `--policy` is required and names one of the 
 policies in `lab.agent.scripted`. Without `--manifest` the episode is built with `make_spec`
 (controlled profile, `agent_directed`, status tool on unless `--no-status`). With it, the
 named episode is read from the manifest file. Connection details come from the environment
-of `.env.example` (see `RunnerConfig.from_env`).
+of `.env.example` (see `RunnerConfig.from_env`). Set OTEL_EXPORTER_OTLP_ENDPOINT to export
+a trace of the episode (see `lab.obs`); it is off otherwise.
 
 Prints one JSON line: the ids, the claim and the verdict the oracle wrote to `results`.
 Exit status 0 on a completed episode, 2 on a refusal (bad arguments, an unsupported mode,
@@ -26,6 +27,7 @@ from lab.runner.tracing import force_tracing_off
 
 force_tracing_off()
 
+from lab import obs  # noqa: E402
 from lab.agent.scripted import SCRIPTED_POLICIES, ScriptedModel  # noqa: E402
 from lab.protocol.faults import World  # noqa: E402
 from lab.protocol.manifest import EpisodeSpec, Manifest, Mode, make_spec  # noqa: E402
@@ -98,13 +100,17 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
         if args.deadline_s is not None:
             overrides["episode_deadline_s"] = args.deadline_s
         config = RunnerConfig.from_env(environ, **overrides)
-        result = run_spec(
-            spec,
-            ScriptedModel(args.policy),
-            config,
-            manifest_sha256=manifest_sha256,
-            experiment_name=name,
-        )
+        obs.configure(environ)  # tracing only if OTEL_EXPORTER_OTLP_ENDPOINT is set
+        try:
+            result = run_spec(
+                spec,
+                ScriptedModel(args.policy),
+                config,
+                manifest_sha256=manifest_sha256,
+                experiment_name=name,
+            )
+        finally:
+            obs.flush()
     except RunnerError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

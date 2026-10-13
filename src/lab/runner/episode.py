@@ -21,7 +21,9 @@ final claim. Everything that decides where a charge lands comes from here: the t
 configuration constant, the namespace is generated per run, the run id and thread id are
 generated per run, and the episode id and task id come from the spec. They are put in a
 `TrustedContext`, which the simulator client reads once, and nothing in it is read back from
-a model message.
+a model message. The run and episode ids also go to the tracing context (`lab.obs.episode`),
+which stamps them on the episode, model and tool spans; tracing is off unless
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set and never changes what the episode does.
 
 Evaluator and runner are kept apart, and the split is the constraint "the evaluator reads the
 payment ledger through `ledger_reader` and never reads the runtime database to decide a
@@ -63,6 +65,7 @@ import psycopg
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg.types.json import Jsonb
 
+from lab import obs
 from lab.agent.client import SimulatorClient, TrustedContext
 from lab.agent.executor import DirectExecutor
 from lab.agent.graph import EpisodeState, PostgresRecorder, build_graph, run_episode
@@ -478,7 +481,10 @@ def run_spec(
                 {"role": "system", "content": system_prompt(spec.prompt_variant)},
                 {"role": "user", "content": user_prompt(spec.task, spec.profile)},
             ]
-            with PostgresSaver.from_conn_string(config.runtime_url) as saver:
+            with (
+                PostgresSaver.from_conn_string(config.runtime_url) as saver,
+                obs.episode(run_id, spec.episode_id) as trace,
+            ):
                 graph = build_graph(
                     model,
                     DirectExecutor(client),
@@ -486,8 +492,10 @@ def run_spec(
                     config.max_turns,
                     recorder=PostgresRecorder(rt, run_id),
                     checkpointer=saver,
+                    trace=trace,
                 )
                 state: EpisodeState = run_episode(graph, thread_id, messages, durability=DURABILITY)
+                trace.finish(ended_by=state["ended_by"], turns=state["turn"])
         except BaseException:
             _transition(rt, run_id, "running", "crashed", finished_at=clock())
             raise

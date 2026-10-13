@@ -41,6 +41,7 @@ from lab.agent.executor import (
     not_sent_outcome,
 )
 from lab.agent.model import ModelClient, ModelTurn, ToolCall
+from lab.obs import NO_TRACE, EpisodeTrace
 
 REPORT_DONE = "report_done"
 
@@ -158,8 +159,13 @@ def build_graph(
     *,
     recorder: Recorder,
     checkpointer: BaseCheckpointSaver,
+    trace: EpisodeTrace = NO_TRACE,
 ) -> Any:
     """Compile the loop. `tools` is the schema list passed to every `model.complete` call.
+
+    `trace` is the runner's tracing context (`lab.obs.episode`): each model call and each
+    tool call runs inside a span of it. The default does nothing. Tracing never feeds back
+    into the loop, and the `Recorder` rows stay the record of what happened.
 
     `checkpointer` is a `PostgresSaver` on a `runtime_svc` connection in production
     (`PostgresSaver.from_conn_string` sets the autocommit, dict_row and prepare_threshold=0
@@ -171,9 +177,11 @@ def build_graph(
     def model_node(state: EpisodeState) -> dict[str, Any]:
         turn = state["turn"]
         messages = state["messages"]
-        started = time.perf_counter()
-        result = model.complete(copy.deepcopy(messages), copy.deepcopy(tools))
-        latency_ms = (time.perf_counter() - started) * 1000
+        with trace.model_call(model_id=model.model_id, turn=turn) as span:
+            started = time.perf_counter()
+            result = model.complete(copy.deepcopy(messages), copy.deepcopy(tools))
+            latency_ms = (time.perf_counter() - started) * 1000
+            span.record_usage(result.input_tokens, result.output_tokens)
         recorder.record_model_call(
             turn=turn,
             provider_model_id=model.model_id,
@@ -196,14 +204,16 @@ def build_graph(
         claimed: str | None = None
         for raw in messages[-1]["tool_calls"]:
             call = ToolCall(**raw)
-            if done:
-                outcome = not_sent_outcome(call, RULE_NOT_EXECUTED_AFTER_DONE)
-            elif call.name == REPORT_DONE:
-                done = True
-                claimed = _claimed_outcome(call.arguments)
-                outcome = not_sent_outcome(call, RULE_REPORT_DONE)
-            else:
-                outcome = executor.execute(call)
+            with trace.tool_call(tool=call.name, call_id=call.id, turn=turn) as span:
+                if done:
+                    outcome = not_sent_outcome(call, RULE_NOT_EXECUTED_AFTER_DONE)
+                elif call.name == REPORT_DONE:
+                    done = True
+                    claimed = _claimed_outcome(call.arguments)
+                    outcome = not_sent_outcome(call, RULE_REPORT_DONE)
+                else:
+                    outcome = executor.execute(call)
+                span.record_tool_outcome(outcome.rule, outcome.http_status)
             recorder.record_tool_event(turn=turn, tool=call.name, outcome=outcome)
             messages.append(
                 {

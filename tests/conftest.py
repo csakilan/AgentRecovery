@@ -121,3 +121,16 @@ def admin_url():
 @pytest.fixture(scope="session")
 def runtime_svc_password():
     return RUNTIME_SVC_PASSWORD
+
+
+@pytest.fixture(autouse=True)
+def isolate_tracing(monkeypatch):
+    """No test inherits an OpenTelemetry setting from the shell, and none leaves a tracing
+    provider behind (lab.obs keeps its own, not OpenTelemetry's process-global one)."""
+    from lab import obs
+
+    for name in [n for n in os.environ if n.startswith("OTEL_")]:
+        monkeypatch.delenv(name)
+    obs.reset()
+    yield
+    obs.reset()

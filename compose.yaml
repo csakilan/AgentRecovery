@@ -114,5 +114,22 @@ services:
       retries: 10
       start_period: 5s
 
+  # Optional trace viewer, off by default: the `tracing` profile keeps it out of a plain
+  # `docker compose up` and out of the CI stack job. To use it:
+  #
+  #   docker compose --profile tracing up -d jaeger
+  #   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 uv run python -m lab.runner run ...
+  #
+  # then open http://127.0.0.1:16686. Without that variable the lab exports nothing (see
+  # src/lab/obs.py). Both ports are published on loopback only. Jaeger v2 keeps traces in
+  # memory here, so they are gone when the container stops. Traces are for debugging and the
+  # demo; the scoring records are the Postgres rows.
+  jaeger:
+    image: jaegertracing/jaeger:2.4.0
+    profiles: ["tracing"]
+    ports:
+      - "127.0.0.1:16686:16686"
+      - "127.0.0.1:4318:4318"
+
 volumes:
   pgdata: {}
