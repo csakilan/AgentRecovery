@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 
 from lab.agent.model import ModelTurn, ToolCall
-from lab.runtime.budget import assert_model_allowed
+from lab.runtime.budget import RequestBudget, assert_model_allowed
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _MAX_BACKOFF_S = 60.0
@@ -35,7 +35,9 @@ class OpenRouterClient:
     `min_interval_s` apart. Transport errors and 429/5xx statuses are retried with exponential
     backoff (honouring `Retry-After`); a malformed response body is returned as a malformed
     turn rather than raised. The API key comes from the argument or `OPENROUTER_API_KEY`
-    and goes nowhere except the Authorization header.
+    and goes nowhere except the Authorization header. When a `RequestBudget` is given, each
+    call to `complete` claims one request from it before the first attempt, and raises
+    `BudgetExceeded` without sending anything if the daily ceiling would be passed.
     """
 
     def __init__(
@@ -48,6 +50,7 @@ class OpenRouterClient:
         min_interval_s: float = 3.0,
         max_retries: int = 5,
         timeout_s: float = 60.0,
+        budget: RequestBudget | None = None,
     ) -> None:
         assert_model_allowed(model_id)
         key = api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY")
@@ -59,6 +62,7 @@ class OpenRouterClient:
         self._url = f"{base_url.rstrip('/')}/chat/completions"
         self._min_interval_s = min_interval_s
         self._max_retries = max_retries
+        self._budget = budget
         self._last_request_monotonic: float | None = None
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
@@ -70,6 +74,10 @@ class OpenRouterClient:
             body["tools"] = to_openai_tools(tools)
         headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         failure = "no attempt made"
+        if self._budget is not None:
+            # One claim per logical request, before anything is sent. Retries do not re-claim,
+            # and BudgetExceeded propagates so an over-budget request never leaves.
+            self._budget.claim(1)
         for attempt in range(self._max_retries + 1):
             self._pace()
             wait = min(2.0**attempt, _MAX_BACKOFF_S)

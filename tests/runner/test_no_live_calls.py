@@ -220,6 +220,26 @@ def test_a_whole_episode_makes_no_refused_attempt(runner_config, network_guard: 
     assert network_guard.blocked[before:] == []
 
 
+def test_the_openrouter_client_cannot_reach_the_network_under_the_guard(
+    network_guard: NetworkGuard,
+):
+    """A real client with its own httpx.Client, aimed at the real default host, is refused.
+    The client retries nothing here (max_retries=0) and surfaces the refused connection."""
+    from lab.agent.openrouter import OpenRouterClient, OpenRouterError
+
+    client = OpenRouterClient(
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        api_key="k",
+        min_interval_s=0.0,
+        max_retries=0,
+    )
+    with network_guard.expecting() as seen:
+        with pytest.raises((OpenRouterError, OSError)):
+            client.complete([{"role": "user", "content": "x"}], [])
+    assert len(seen) == 1
+    assert seen[0].target.split(":")[0] == "openrouter.ai"
+
+
 # ---------------------------------------------------------------------------
 # LangSmith
 # ---------------------------------------------------------------------------
@@ -303,7 +323,9 @@ HOST_STRINGS_ALLOWED = {
     "tests/runner/test_no_live_calls.py": "probes the hosts the guard must refuse",
     # The OpenRouter client's default base_url must name openrouter.ai, so the host-string
     # scan cannot protect this one file. Its imports are still scanned here, and the live
-    # socket guard (asserted for this client below) is what actually stops a real request.
+    # socket guard (asserted for this client in this file, by
+    # test_the_openrouter_client_cannot_reach_the_network_under_the_guard) is what actually
+    # stops a real request.
     "src/lab/agent/openrouter.py": "the OpenRouter client whose default base_url names the host",
 }
 
