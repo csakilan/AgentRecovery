@@ -70,6 +70,12 @@ uv run ruff check .                             # lint
 uv run ruff format --check src tests            # verify Python formatting
 ```
 
+Tracing is off by default. To look at an episode in Jaeger: `docker compose --profile
+tracing up -d jaeger`, then `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 uv run python
+-m lab.runner run ...`, then open http://127.0.0.1:16686. The default `docker compose up` and
+the CI stack job do not start Jaeger. Traces are for debugging and the demo; Postgres rows
+decide every verdict (see `src/lab/obs.py`).
+
 The locked formatter also checks Python examples inside Markdown. A whole-repo
 format check currently flags the two planning documents. Those examples have
 not been reformatted; the plans are preserved. Address that check's scope before

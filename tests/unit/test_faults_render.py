@@ -2,7 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from lab.protocol.faults import FaultPlan, World, world_fault_plan
-from lab.protocol.render import render_charge, render_status
+from lab.protocol.render import reason_phrase, render_charge, render_status
 
 
 def test_world_plans_match_the_original_episode():
@@ -75,3 +75,20 @@ def test_render_status_outage():
     assert render_status(503, body) == (
         "HTTP 503 Service Unavailable: payment status service is temporarily unavailable."
     )
+
+
+def test_reason_phrase_names_the_statuses_render_prints_and_falls_back_to_error():
+    assert [reason_phrase(s) for s in (400, 404, 409, 500, 503, 504)] == [
+        "Bad Request",
+        "Not Found",
+        "Conflict",
+        "Internal Server Error",
+        "Service Unavailable",
+        "Gateway Timeout",
+    ]
+    assert reason_phrase(422) == "Error"
+    # 200 is named only for callers that describe a 200 they cannot render; render_charge and
+    # render_status never print a reason for it.
+    assert reason_phrase(200) == "OK"
+    body = {"error": {"message": "x"}}
+    assert render_charge(422, body) == "HTTP 422 Error: x"
