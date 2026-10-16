@@ -115,3 +115,66 @@ def test_the_command_has_no_way_to_name_a_real_model():
         _parse(["run"])  # --policy is required
     with pytest.raises(SystemExit):
         _parse(["run", "--policy", "stable_key", "--model", "anything:free"])
+
+
+def test_study_subcommand_uses_run_manifest(monkeypatch, environ, capsys):
+    import lab.runner.__main__ as m
+    from lab.agent.scripted import ScriptedModel
+    from lab.runner.batch import BatchSummary
+
+    captured = {}
+
+    def fake_run_manifest(manifest, model, config, *, experiment_name):
+        captured["n"] = len(manifest.episodes)
+        captured["name"] = experiment_name
+        return BatchSummary("exp-x", model.model_id, len(manifest.episodes), 0, 0)
+
+    monkeypatch.setattr(m, "run_manifest", fake_run_manifest)
+    monkeypatch.setattr(m, "build_study_models", lambda config: [ScriptedModel("stable_key")])
+    rc = m.main(["study", "--reps", "1", "--experiment-name", "runner-test-study"], environ)
+    assert rc == 0 and captured["n"] == 4 and captured["name"] == "runner-test-study"
+    assert json.loads(capsys.readouterr().out) == {
+        "experiment_id": "exp-x",
+        "model_id": "scripted/stable_key",
+        "completed": 4,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+
+def test_study_moves_to_the_next_model_only_when_one_never_worked(monkeypatch, environ, capsys):
+    import lab.runner.__main__ as m
+    from lab.agent.scripted import ScriptedModel
+    from lab.runner.batch import BatchSummary
+
+    tried = []
+    outcomes = {"scripted/give_up": (0, 0, 4), "scripted/stable_key": (4, 0, 0)}
+
+    def fake_run_manifest(manifest, model, config, *, experiment_name):
+        tried.append(model.model_id)
+        return BatchSummary("exp-" + model.model_id, model.model_id, *outcomes[model.model_id])
+
+    monkeypatch.setattr(m, "run_manifest", fake_run_manifest)
+    monkeypatch.setattr(
+        m,
+        "build_study_models",
+        lambda config: [ScriptedModel("give_up"), ScriptedModel("stable_key")],
+    )
+    assert m.main(["study", "--reps", "1"], environ) == 0
+    assert tried == ["scripted/give_up", "scripted/stable_key"]
+    assert json.loads(capsys.readouterr().out)["model_id"] == "scripted/stable_key"
+
+    tried.clear()
+    outcomes["scripted/give_up"] = (3, 1, 0)  # completed some: it is the study, stop here
+    assert m.main(["study", "--reps", "1"], environ) == 0
+    assert tried == ["scripted/give_up"]
+
+
+def test_run_cannot_reach_the_real_models(monkeypatch, environ):
+    import lab.runner.__main__ as m
+
+    def boom(config):
+        raise AssertionError("run must not build the study models")
+
+    monkeypatch.setattr(m, "build_study_models", boom)
+    assert m.main(["run", "--policy", "stable_key", "--world", "lost_ack"], environ) == 0

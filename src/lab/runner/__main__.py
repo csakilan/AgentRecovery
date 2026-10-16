@@ -2,9 +2,14 @@
 
     python -m lab.runner run --policy stable_key --world lost_ack
     python -m lab.runner run --policy give_up --manifest m.json --episode "behavior/lost_ack/..."
+    python -m lab.runner study [--reps N] [--seed S] [--experiment-name NAME]
 
-Plan 2 has no path to a real model: `--policy` is required and names one of the scripted
-policies in `lab.agent.scripted`. Without `--manifest` the episode is built with `make_spec`
+`run` has no path to a real model: `--policy` is required and names one of the scripted
+policies in `lab.agent.scripted`. The real models are reachable only through `study`, which
+runs the behaviour matrix with the first of `lab.runner.batch.STUDY_MODELS` that works (each
+model is its own experiment) and prints the chosen model's batch summary.
+
+Without `--manifest` the `run` episode is built with `make_spec`
 (controlled profile, `agent_directed`, status tool on unless `--no-status`). With it, the
 named episode is read from the manifest file. Connection details come from the environment
 of `.env.example` (see `RunnerConfig.from_env`). Set OTEL_EXPORTER_OTLP_ENDPOINT to export
@@ -18,6 +23,7 @@ missing configuration).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -30,8 +36,15 @@ force_tracing_off()
 from lab import obs  # noqa: E402
 from lab.agent.scripted import SCRIPTED_POLICIES, ScriptedModel  # noqa: E402
 from lab.protocol.faults import World  # noqa: E402
-from lab.protocol.manifest import EpisodeSpec, Manifest, Mode, make_spec  # noqa: E402
+from lab.protocol.manifest import (  # noqa: E402
+    EpisodeSpec,
+    Manifest,
+    Mode,
+    behavior_matrix,
+    make_spec,
+)
 from lab.protocol.task import Profile  # noqa: E402
+from lab.runner.batch import BatchSummary, build_study_models, run_manifest  # noqa: E402
 from lab.runner.episode import (  # noqa: E402
     EpisodeResult,
     RunnerConfig,
@@ -52,6 +65,10 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     run.add_argument("--episode", help="episode id inside --manifest")
     run.add_argument("--max-turns", type=int, help="override RunnerConfig.max_turns")
     run.add_argument("--deadline-s", type=float, help="override RunnerConfig.episode_deadline_s")
+    study = commands.add_parser("study", help="run the behaviour matrix against the real models")
+    study.add_argument("--reps", type=int, default=12, help="repetitions per world x status cell")
+    study.add_argument("--seed", type=int, default=20261004, help="manifest seed")
+    study.add_argument("--experiment-name", default="behaviour-study")
     return parser.parse_args(argv)
 
 
@@ -85,8 +102,42 @@ def _summary(result: EpisodeResult) -> dict[str, object]:
     }
 
 
+def _study(args: argparse.Namespace, environ: Mapping[str, str] | None) -> BatchSummary:
+    """Run the matrix with each study model in turn; the first one that completes is the study.
+
+    A model that completes nothing and failed at least once never worked, so the next one is
+    tried (each model is its own experiment, so nothing is mixed). If none works, the last
+    summary is returned."""
+    if args.reps < 1:
+        raise RunnerError(f"--reps must be at least 1, got {args.reps}")
+    config = RunnerConfig.from_env(environ)
+    manifest = behavior_matrix(reps=args.reps, seed=args.seed)
+    models = build_study_models(config)
+    if not models:
+        raise RunnerError("no study models")
+    summary: BatchSummary | None = None
+    for model in models:
+        summary = run_manifest(manifest, model, config, experiment_name=args.experiment_name)
+        if summary.completed > 0 or summary.failed == 0:
+            break
+    assert summary is not None
+    return summary
+
+
 def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None) -> int:
     args = _parse(argv)
+    if args.command == "study":
+        try:
+            obs.configure(environ)
+            try:
+                summary = _study(args, environ)
+            finally:
+                obs.flush()
+        except RunnerError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(dataclasses.asdict(summary)))
+        return 0
     try:
         spec, manifest_sha256, name = _spec_and_manifest(args)
         if spec.profile is not Profile.CONTROLLED:

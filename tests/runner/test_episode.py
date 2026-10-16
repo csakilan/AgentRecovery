@@ -44,12 +44,14 @@ from lab.runner.episode import (
     RunnerConfig,
     ScoringError,
     UnsupportedModeError,
+    clear_incomplete_run,
     configure_namespace,
     derive_experiment_id,
     evaluate_episode,
     experiment_config,
     new_namespace,
     rescore_run,
+    run_is_complete,
     run_spec,
 )
 from tests.runner.conftest import EXPERIMENT_NAME_PREFIX
@@ -927,4 +929,66 @@ def test_configure_namespace_sends_the_spec_fault_plan(runner_config, payments_d
     assert row[0] == "controlled"
     assert json.dumps(row[1], sort_keys=True) == json.dumps(
         spec.fault_plan.model_dump(mode="json"), sort_keys=True
+    )
+
+
+def _crash_an_episode(config: RunnerConfig, spec) -> str:
+    """Run `spec` with a model that falls over after its first turn; return the experiment id."""
+
+    class Falls(ScriptedModel):
+        def complete(self, messages, tools):
+            if any(m.get("role") == "tool" for m in messages):
+                raise RuntimeError("the provider fell over")
+            return super().complete(messages, tools)
+
+    with pytest.raises(RuntimeError):
+        run_spec(
+            spec,
+            Falls("stable_key"),
+            config,
+            manifest_sha256=SHA,
+            experiment_name=NAME,
+        )
+    return derive_experiment_id(NAME, experiment_config("scripted/stable_key", config, SHA))
+
+
+def test_run_is_complete_is_false_for_a_crashed_run_and_true_for_a_scored_one(runner_config, rt):
+    crashed_spec = spec_for(World.LOST_ACK)
+    experiment_id = _crash_an_episode(runner_config, crashed_spec)
+    assert run_is_complete(rt, experiment_id, crashed_spec.episode_id) is False
+    assert run_is_complete(rt, experiment_id, "no-such-episode") is False
+
+    scored = run("stable_key", World.TRUE_FAIL, runner_config)
+    assert scored.experiment_id == experiment_id
+    assert run_is_complete(rt, experiment_id, scored.episode_id) is True
+
+
+def test_clear_incomplete_run_deletes_a_crashed_run_but_never_a_completed_one(runner_config, rt):
+    crashed_spec = spec_for(World.LOST_ACK)
+    experiment_id = _crash_an_episode(runner_config, crashed_spec)
+    crashed = one(rt, "SELECT id FROM runs WHERE episode_id = %s", crashed_spec.episode_id)
+    assert rt.execute("SELECT 1 FROM model_calls WHERE run_id = %s", (crashed["id"],)).fetchone(), (
+        "the crashed run should have recorded its first turn, to prove the cascade"
+    )
+
+    scored = run("stable_key", World.TRUE_FAIL, runner_config)
+
+    clear_incomplete_run(rt, experiment_id, crashed_spec.episode_id)
+    clear_incomplete_run(rt, experiment_id, scored.episode_id)
+
+    assert rt.execute("SELECT 1 FROM runs WHERE id = %s", (crashed["id"],)).fetchone() is None
+    assert (
+        rt.execute("SELECT 1 FROM model_calls WHERE run_id = %s", (crashed["id"],)).fetchone()
+        is None
+    )
+    assert one(rt, "SELECT state FROM runs WHERE id = %s", scored.run_id)["state"] == "completed"
+    assert result_row(rt, scored.run_id)["verdict"] == scored.score.verdict.value
+
+
+def test_clear_incomplete_run_leaves_a_score_failed_run_alone(runner_config, rt):
+    scored = run("stable_key", World.LOST_ACK, runner_config)
+    rt.execute("UPDATE runs SET state = 'score_failed' WHERE id = %s", (scored.run_id,))
+    clear_incomplete_run(rt, scored.experiment_id, scored.episode_id)
+    assert one(rt, "SELECT state FROM runs WHERE id = %s", scored.run_id)["state"] == (
+        "score_failed"
     )
