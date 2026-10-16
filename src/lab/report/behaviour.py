@@ -112,10 +112,15 @@ def render_markdown(
     model_id: str,
     experiment_id: str,
     manifest_sha256: str,
-    reps: int,
+    reps: int | None = None,
     unscored: Mapping[str, int] | None = None,
 ) -> str:
-    """Plain-prose findings: one table of raw verdict counts per cell, then its rate."""
+    """Plain-prose findings: one table of raw verdict counts per cell, then its rate.
+
+    `reps` is accepted for the documented interface and is not written into the text. A pooled
+    repetition count can contradict the tables when cells hold different numbers of trials, so
+    the sample-size sentence is derived from the cells' own `n`.
+    """
     cells = list(cells)
     total = sum(c.n for c in cells)
     lines = [
@@ -123,21 +128,32 @@ def render_markdown(
         "",
         f"Model: {model_id}. Experiment: {experiment_id}. Manifest SHA-256: {manifest_sha256}.",
         "",
-        f"This report covers {total} scored trials in {len(cells)} conditions. "
-        f"Each condition was run {reps} times, which is an exploratory sample size. "
-        "The intervals below are wide at this size, so the rates show a direction and are "
-        "too imprecise to rank conditions that sit close together.",
-        "",
-        "A trial counts toward the correct-recovery rate only when it was eligible for recovery, "
-        "meaning a fault that a careful agent could recover from. "
-        "The interval is a 95 percent Wilson score interval on that rate. "
-        "The raw verdict counts are given for every condition, including the ones at zero.",
-        "",
     ]
+    if cells:
+        low_n, high_n = min(c.n for c in cells), max(c.n for c in cells)
+        per_condition = (
+            f"Each condition holds {low_n} scored trials"
+            if low_n == high_n
+            else f"Each condition holds between {low_n} and {high_n} scored trials"
+        )
+        lines += [
+            f"This report covers {total} scored trials in {len(cells)} conditions. "
+            f"{per_condition}, which is an exploratory sample size. "
+            "The intervals below are wide at this size, so the rates show a direction and are "
+            "too imprecise to rank conditions that sit close together.",
+            "",
+            "A trial counts toward the correct-recovery rate only when it was eligible for "
+            "recovery, meaning a fault that a careful agent could recover from. "
+            "The interval is a 95 percent Wilson score interval on that rate. "
+            "The raw verdict counts are given for every condition, including the ones at zero.",
+            "",
+        ]
+    else:
+        lines += ["No scored episodes yet, so there are no counts or rates to report.", ""]
     if unscored:
         parts = ", ".join(f"{count} {state}" for state, count in sorted(unscored.items()))
         lines += [
-            f"Runs with no verdict are left out of every count above and below: {parts}.",
+            f"Runs with no verdict are left out of every count in this report: {parts}.",
             "",
         ]
     names = [v.name for v in Verdict]
@@ -181,6 +197,9 @@ def _read_experiment(
     if header is None:
         raise LookupError(f"no experiment {experiment_id!r} in the runtime database")
     manifest_sha256, config = header
+    # results.run_id is the table's PRIMARY KEY (0001_init.sql), so this join is one-to-one: a
+    # run re-scored under a new evaluator_version has its row replaced in place, and a run can
+    # never appear twice here. No DISTINCT or version selection is needed.
     records = conn.execute(
         "SELECT r.id, r.episode_id, r.state, s.verdict, s.correct_recovery, s.score_json"
         " FROM runs r LEFT JOIN results s ON s.run_id = r.id"
@@ -238,11 +257,10 @@ def write_report(experiment_id: str, runtime_url: str, out_dir: Path) -> Path:
     with psycopg.connect(runtime_url, autocommit=True) as conn:
         model_id, manifest_sha256, rows, unscored = _read_experiment(conn, experiment_id)
     cells = summarise(rows)
-    reps = len({r.repetition for r in rows})
     out_dir.mkdir(parents=True, exist_ok=True)
     markdown = out_dir / f"{REPORT_STEM}.md"
     markdown.write_text(
-        render_markdown(cells, model_id, experiment_id, manifest_sha256, reps, unscored)
+        render_markdown(cells, model_id, experiment_id, manifest_sha256, unscored=unscored)
     )
     _write_csv(out_dir / f"{REPORT_STEM}.csv", cells)
     with (out_dir / f"{REPORT_STEM}.jsonl").open("w") as handle:

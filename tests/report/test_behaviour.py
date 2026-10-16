@@ -98,7 +98,13 @@ def test_markdown_carries_provenance_raw_counts_and_the_exploratory_sentence():
         manifest_sha256="ab12cd",
         reps=7,
     )
-    for needed in ("vendor/model-x", "exp-77", "ab12cd", "exploratory", "7 times"):
+    for needed in (
+        "vendor/model-x",
+        "exp-77",
+        "ab12cd",
+        "exploratory",
+        "between 1 and 3 scored trials",
+    ):
         assert needed in text
     assert "—" not in text and "–" not in text  # no em or en dashes
     # Raw counts are written from the cells: lost_ack has 3 trials, 2 of them DUPLICATE.
@@ -198,7 +204,8 @@ def test_write_report_reads_rows_and_writes_three_files(runtime_db, tmp_path):
     assert exp in text and "vendor/model-x" in text and "deadbeef" in text
     assert "FALSE_SUCCESS" in text and "| FALSE_SUCCESS | 0 |" in text  # listed, with zero count
     assert "1 crashed" in text
-    assert "3 times" in text  # repetitions r00, r01, r02 seen
+    # Cells hold 2, 1 and 1 trials; the text must say so, not a pooled repetition count (3).
+    assert "between 1 and 2 scored trials" in text and "3 times" not in text
     lines = [json.loads(line) for line in jsonl_path.read_text().splitlines()]
     assert len(lines) == 4  # the crashed run has no verdict, so no trial line
     assert {line["verdict"] for line in lines} == {"CORRECT", "DUPLICATE", "MISSED"}
@@ -212,3 +219,26 @@ def test_write_report_reads_rows_and_writes_three_files(runtime_db, tmp_path):
 def test_write_report_rejects_an_unknown_experiment(runtime_db, tmp_path):
     with pytest.raises(LookupError):
         write_report("no-such-experiment", runtime_db["svc"], tmp_path)
+
+
+def test_sample_size_wording_follows_the_cells_when_they_are_unequal():
+    rows = [
+        _row("a", True, "CORRECT", correct_recovery=True, eligible=True, repetition=i)
+        for i in range(5)
+    ] + [_row("b", True, "MISSED", correct_recovery=False, eligible=True, repetition=0)] * 2
+    text = render_markdown(summarise(rows), "m", "e", "h", reps=5)
+    assert "between 2 and 5 scored trials" in text
+    assert "run 5 times" not in text and "run 7 times" not in text
+
+
+def test_sample_size_wording_states_one_value_when_cells_are_equal():
+    rows = [_row(w, True, "CORRECT", correct_recovery=True, eligible=True) for w in "ab" * 4]
+    text = render_markdown(summarise(rows), "m", "e", "h", reps=99)
+    assert "Each condition holds 4 scored trials" in text and "99" not in text
+
+
+def test_an_empty_report_says_there_is_no_data_instead_of_describing_it():
+    text = render_markdown([], "m", "e", "h", unscored={"crashed": 1})
+    assert "No scored episodes yet" in text
+    assert "Each condition" not in text and "intervals" not in text
+    assert "1 crashed" in text
