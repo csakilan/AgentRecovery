@@ -1004,3 +1004,68 @@ Carried into Plan 2 from the reviews:
   Closing that properly needs a separate control-plane role.
 - The pool liveness fix matters most for a multi-day frozen run; that is the
   scenario it was found in.
+
+## State as of 2026-10-15, end of Plan 2
+
+Plan 2 is merged into `main` (merge commit `84f3a7e`, nine tasks plus a
+cross-task renderer-parity fix and the final-review doc fixes). The full suite
+is **967 passing** on the merged tree, ruff clean, and both GitHub CI jobs were
+green on the branch head. The whole-branch review cleared it with no Critical or
+Important findings; every per-task deferred minor was triaged "OK to defer".
+
+What shipped: the LangGraph agent loop with Postgres checkpoints and
+`durability="sync"` on every path (`src/lab/agent/graph.py`), the executor that
+separates requested from effective actions and renders model-facing text through
+Plan 1's `src/lab/protocol/render.py` for byte-for-byte compat parity
+(`executor.py`), the scripted model and versioned prompts/tool schemas, the
+simulator client bound to a `TrustedContext` so the agent cannot choose its own
+namespace (`client.py`), the SIGKILL replay experiment and its measured result
+(`docs/replay-findings.md`), the episode runner that scores through the oracle
+and the session-wide no-live-calls network guard (`src/lab/runner/`,
+`tests/network_guard.py`), and optional OpenTelemetry tracing with Jaeger behind
+a Compose profile (`src/lab/obs.py`).
+
+The replay result the thesis rests on: under `durability="sync"`, a tool node
+killed after its charge commits but before the step is checkpointed re-executes
+on resume and re-sends the same idempotency key; the backend absorbs it as a
+replay, so the ledger holds one effect while the resumed graph has no memory of
+the first attempt. Under the default `"async"` the step is lost and re-sent every
+time. This is the argument for a journal outside the graph, which Plan 4 builds.
+
+### Carried into Plan 3 (the real-model behaviour study)
+
+- The first thing Plan 3 does is the free-model conformance pilot the roadmap
+  had listed under Plan 2; it is also the first thing that spends quota. All real
+  model calls were deliberately deferred to Plan 3, so no provider code path
+  exists yet and a socket-level test proves none is reachable.
+- The real OpenRouter client must convert the tool schemas from the original
+  `{name, description, input_schema}` shape (kept for compat parity) into the
+  provider's function-calling format. The schemas are versioned
+  (`TOOL_SCHEMA_VERSION`).
+- `model_calls` uses `ON CONFLICT (run_id, turn) DO NOTHING` on replay. With a
+  deterministic scripted model this loses nothing, but with a non-deterministic
+  real model a replayed turn's stored row can disagree with the checkpointed
+  transcript and the second provider request goes unrecorded (budget accounting).
+  Revisit before the behaviour study relies on the recorded request counts.
+- `force_tracing_off()` clears a langsmith memoisation cache coupled to the
+  pinned langsmith 0.14.7; revisit on any langsmith upgrade.
+- The budget guard (`src/lab/runtime/budget.py`, `assert_model_allowed` plus the
+  `:free` allowlist) is built and tested but not yet wired into the runner,
+  because scripted models consume no provider quota. Plan 3's real client is the
+  seam that wires it in.
+
+### Operational notes
+
+- The dev runtime database needs `python -m lab.runtime migrate` to apply
+  migration `0003` (it adds the `score_failed` run state). Without it, a scoring
+  failure path raises a `CheckViolation`.
+- Jaeger (`jaegertracing/jaeger:2.4.0`, confirmed to exist) has never been pulled
+  or run, so a real OTLP export to it is untested. Tracing is silent by default
+  (no `OTEL_EXPORTER_OTLP_ENDPOINT`, no export).
+- Two user decisions are still open from Plan 2's reviews: whether to document or
+  reject payment keys containing `/` (the Plan 1 simulator accepts such a key on
+  a charge but cannot look it up afterward), and whether to drop the leftover
+  test database `runtime_test_cdbb66c7`.
+
+Full per-task review history, fix rounds and deferred-minor list lived in the
+git-ignored SDD ledger for this plan, now removed; the git history is the record.
