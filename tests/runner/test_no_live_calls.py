@@ -301,6 +301,10 @@ def _docstring_nodes(tree: ast.AST) -> set[int]:
 HOST_STRINGS_ALLOWED = {
     "tests/network_guard.py": "defines PROVIDER_HOSTS, the one list of hosts to refuse",
     "tests/runner/test_no_live_calls.py": "probes the hosts the guard must refuse",
+    # The OpenRouter client's default base_url must name openrouter.ai, so the host-string
+    # scan cannot protect this one file. Its imports are still scanned here, and the live
+    # socket guard (asserted for this client below) is what actually stops a real request.
+    "src/lab/agent/openrouter.py": "the OpenRouter client whose default base_url names the host",
 }
 
 
