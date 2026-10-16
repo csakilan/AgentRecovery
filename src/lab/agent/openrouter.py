@@ -2,17 +2,131 @@
 
 OpenRouter serves an OpenAI-compatible chat completions API. The lab keeps its own shapes:
 tool schemas as `{name, description, input_schema}`, and graph messages whose tool-call
-arguments are dicts. The functions here translate in both directions. Plan 3 owns this
-module, and the HTTP client that calls these functions is added to it in Plan 3 as well.
+arguments are dicts. The functions here translate in both directions, and
+`OpenRouterClient` calls them around one HTTP round trip with retry and pacing.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import os
+import time
 from typing import Any
 
+import httpx
+
 from lab.agent.model import ModelTurn, ToolCall
+from lab.runtime.budget import assert_model_allowed
+
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_BACKOFF_S = 60.0
+_ERROR_TEXT_CHARS = 300
+
+
+class OpenRouterError(RuntimeError):
+    """A request that could not be completed: retries exhausted, or a non-retryable status."""
+
+
+class OpenRouterClient:
+    """A `ModelClient` over OpenRouter's chat completions endpoint.
+
+    Only `:free` models are accepted. Consecutive requests are spaced at least
+    `min_interval_s` apart. Transport errors and 429/5xx statuses are retried with exponential
+    backoff (honouring `Retry-After`); a malformed response body is returned as a malformed
+    turn rather than raised. The API key comes from the argument or `OPENROUTER_API_KEY`
+    and goes nowhere except the Authorization header.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        api_key: str | None = None,
+        http_client: httpx.Client | None = None,
+        base_url: str = "https://openrouter.ai/api/v1",
+        min_interval_s: float = 3.0,
+        max_retries: int = 5,
+        timeout_s: float = 60.0,
+    ) -> None:
+        assert_model_allowed(model_id)
+        key = api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise OpenRouterError("no OpenRouter API key: pass api_key or set OPENROUTER_API_KEY")
+        self.model_id = model_id
+        self._key = key
+        self._http = http_client if http_client is not None else httpx.Client(timeout=timeout_s)
+        self._url = f"{base_url.rstrip('/')}/chat/completions"
+        self._min_interval_s = min_interval_s
+        self._max_retries = max_retries
+        self._last_request_monotonic: float | None = None
+
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
+        body: dict[str, Any] = {
+            "model": self.model_id,
+            "messages": to_openai_messages(messages),
+        }
+        if tools:
+            body["tools"] = to_openai_tools(tools)
+        headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
+        failure = "no attempt made"
+        for attempt in range(self._max_retries + 1):
+            self._pace()
+            wait = min(2.0**attempt, _MAX_BACKOFF_S)
+            try:
+                response = self._http.post(self._url, headers=headers, json=body)
+            except httpx.TransportError as exc:
+                failure = f"transport error {type(exc).__name__}"
+            else:
+                if response.is_success:
+                    return _turn_from_response(response)
+                text = response.text[:_ERROR_TEXT_CHARS]
+                failure = f"HTTP {response.status_code}: {text}"
+                if response.status_code not in _RETRYABLE_STATUSES:
+                    raise OpenRouterError(failure)
+                advised = _retry_after(response)
+                if advised is not None:
+                    wait = advised
+            if attempt < self._max_retries:
+                _sleep(wait)
+        raise OpenRouterError(f"gave up after {self._max_retries + 1} attempts: {failure}")
+
+    def _pace(self) -> None:
+        now = time.monotonic()
+        if self._last_request_monotonic is not None:
+            remaining = self._min_interval_s - (now - self._last_request_monotonic)
+            if remaining > 0:
+                _sleep(remaining)
+                now = time.monotonic()
+        self._last_request_monotonic = now
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    """The `Retry-After` header as seconds, if it is a sane number (dates are ignored)."""
+    try:
+        seconds = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return None
+    if seconds != seconds or seconds < 0:
+        return None
+    return min(seconds, _MAX_BACKOFF_S)
+
+
+def _turn_from_response(response: httpx.Response) -> ModelTurn:
+    try:
+        body = response.json()
+    except (ValueError, RecursionError):
+        return ModelTurn(
+            text=None,
+            tool_calls=(),
+            raw={"raw_body": response.text[:2000]},
+            malformed=True,
+        )
+    return parse_completion(body)
 
 
 def to_openai_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
