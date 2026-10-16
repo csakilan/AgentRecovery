@@ -1069,3 +1069,38 @@ time. This is the argument for a journal outside the graph, which Plan 4 builds.
 
 Full per-task review history, fix rounds and deferred-minor list lived in the
 git-ignored SDD ledger for this plan, now removed; the git history is the record.
+
+## State as of 2026-10-16, end of Plan 3
+
+Plan 3 (the real-model behaviour study) is on branch plan-3-behaviour-study, built
+and reviewed. It adds the OpenRouter client (src/lab/agent/openrouter.py: schema and
+message conversion, retry, rate-limit pacing, :free-only refusal, a once-per-request
+cross-process budget claim, and a never-raise-on-a-bad-body contract), the resumable
+batch runner (src/lab/runner/batch.py, one model per experiment, with a `study`
+subcommand that is the only path that builds the real client), two episode.py resume
+helpers whose invariant is that a scored result is never deleted, and the report
+generator (src/lab/report/behaviour.py: Wilson intervals, per-cell summaries,
+markdown plus CSV plus JSONL). The whole-branch review passed with no Critical or
+Important findings. The suite was 1016 passing before the real run.
+
+The real run happened once. The pinned primary nvidia/nemotron-3-ultra-550b-a55b:free
+did not respond (no reply at 30 or 120 seconds), so the ordered fallback ran the full
+48-episode matrix on nvidia/nemotron-3-super-120b-a12b:free. The baseline (mode A, the
+model alone, controlled profile) is 45 of 48 CORRECT and 3 WRONG_EFFECT, with correct
+recovery in 44 of 48 eligible trials. The number is in docs/behaviour-findings.md
+(plus .csv and .jsonl); the model-availability deviation is decision D12. This is the
+baseline half of the resume framing in D10; Plan 4's durable gateway is the treatment.
+
+Operational: the dev run used the Compose stack already up on this host (Postgres on
+54329, simulator on 8100 and 8101) and `python -m lab.runner study --reps 12`, with the
+dev env from .env.example and OPENROUTER_API_KEY from the gitignored .env. The study is
+resumable (completed, scored episodes are skipped; crashed ones are cleared and retried),
+but run it to completion in one pass to avoid the split-across-models edge on a partial
+resume. No paid request is reachable: a socket-level test refuses any non-loopback
+connect, and a test proves the OpenRouter client raises under that guard.
+
+Carried into Plan 4 (execution modes and the durable gateway): the roadmap's modes B and
+C, the intent journal, leases, the outbox and the recovery sweeper. The agent loop records
+each tool call's requested versus effective arguments already, which is the seam modes B
+and C change. Plan 2 Task 7 measured that a replayed tool call is absorbed by the backend's
+idempotency record, which is the argument for the journal Plan 4 builds.
