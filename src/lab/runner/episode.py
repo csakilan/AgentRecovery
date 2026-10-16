@@ -285,6 +285,33 @@ def _insert_queued_run(
         ) from exc
 
 
+def run_is_complete(rt: psycopg.Connection[Any], experiment_id: str, episode_id: str) -> bool:
+    """True iff the episode has a `completed` run with a `results` row: it ran and was scored."""
+    row = rt.execute(
+        "SELECT 1 FROM runs JOIN results ON results.run_id = runs.id"
+        " WHERE runs.experiment_id = %s AND runs.episode_id = %s AND runs.state = 'completed'",
+        (experiment_id, episode_id),
+    ).fetchone()
+    return row is not None
+
+
+# States whose run holds nothing worth keeping: it never reached a verdict. `score_failed` is
+# left out on purpose, because its agent side is complete and `rescore_run` finishes it.
+_CLEARABLE_STATES = ("queued", "running", "crashed")
+
+
+def clear_incomplete_run(rt: psycopg.Connection[Any], experiment_id: str, episode_id: str) -> None:
+    """Delete the episode's run row so the episode can be run again, if it never finished.
+
+    Only a `queued`, `running` or `crashed` run is deleted (its model_calls, tool_events and
+    crash_points go with it by cascade). A `completed` or `score_failed` run is never touched,
+    which is what makes resuming a batch safe: a scored result cannot be destroyed."""
+    rt.execute(
+        "DELETE FROM runs WHERE experiment_id = %s AND episode_id = %s AND state = ANY(%s)",
+        (experiment_id, episode_id, list(_CLEARABLE_STATES)),
+    )
+
+
 def _transition(
     conn: psycopg.Connection[Any], run_id: str, source: str, target: str, **columns: Any
 ) -> None:

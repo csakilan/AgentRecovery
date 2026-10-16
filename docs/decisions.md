@@ -338,3 +338,33 @@ separate repository whose releases section is empty and whose schema URL reads
 not depend on them and do not claim conformance to them. Structured events in
 Postgres remain the source of record for scoring; traces are for debugging and
 the demo, as D6 already says.
+
+## D12. No conformance pilot; the behaviour baseline ran on the reachable fallback model
+
+**Date:** 2026-10-16
+**Status:** accepted by the user, 2026-10-16
+
+Two choices about the Plan 3 behaviour study, recorded rather than applied silently.
+
+First, the D2 conformance pilot was dropped at the user's instruction: pick a
+free tool-capable model directly rather than screen candidates with 24 pilot
+episodes. The risk D2 guarded against (a model that emits malformed tool calls
+corrupting the matrix) is still covered, because the oracle scores a malformed
+first charge as its own verdict, so poor conformance shows up in the study
+itself instead of a separate pilot. This spent 0 pilot requests.
+
+Second, the pinned primary `nvidia/nemotron-3-ultra-550b-a55b:free` was listed
+as live in the models metadata but did not respond to a chat-completions request
+at run time: a direct call returned nothing at both 30 and 120 seconds, and all
+48 of its episodes crashed with no model call recorded. The runner's ordered
+fallback then ran the whole 48-episode matrix on the first fallback,
+`nvidia/nemotron-3-super-120b-a12b:free`, which completed cleanly. The behaviour
+baseline is therefore attributed to the 120B model, not Ultra. The study spent
+nothing, because both models are free. If Ultra's free endpoint becomes usable
+later, the study can be re-run against it as its own experiment; the 120B result
+stands as the recorded baseline until then.
+
+The baseline result (mode A, the model alone, controlled profile, 48 episodes):
+45 of 48 verdicts CORRECT and 3 WRONG_EFFECT, with correct recovery in 44 of 48
+eligible trials. Per-condition Wilson intervals are in docs/behaviour-findings.md.
+Twelve repetitions per cell is an exploratory size, stated in the report.
