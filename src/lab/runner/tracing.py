@@ -29,6 +29,9 @@ def force_tracing_off(environ: MutableMapping[str, str] | None = None) -> None:
     for name in TRACING_VARIABLES:
         env[name] = "false"
     # langsmith memoises its environment lookups; drop a value cached before this call.
+    # This is coupled to the pinned langsmith version (0.14.7). It relies on
+    # langsmith.utils.get_env_var being a memoised function with cache_clear(). If langsmith
+    # is upgraded, revisit this, since a later version may memoise through a different accessor.
     utils = sys.modules.get("langsmith.utils")
     cache_clear = getattr(getattr(utils, "get_env_var", None), "cache_clear", None)
     if cache_clear is not None:

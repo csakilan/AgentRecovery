@@ -5,7 +5,7 @@ keeps what the model asked for (`requested_*`) apart from what was actually sent
 (`effective_*`), because that gap is the experiment: a runtime that rewrites the idempotency
 key is an infrastructure fix, not evidence of better model reasoning. `DirectExecutor` is
 mode A (`agent_directed`): it sends exactly what the model asked for, so effective equals
-requested. Plan 3's other executors will differ in what they send, not in this record.
+requested. Plan 4's other executors will differ in what they send, not in this record.
 
 `report_done` never reaches an executor. It is not a request to the simulator, and the graph
 handles it.
