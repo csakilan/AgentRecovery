@@ -60,6 +60,8 @@ def parse_completion(body: dict[str, Any]) -> ModelTurn:
     A response whose choice, content or tool-call arguments cannot be read comes back with
     `malformed=True` and no tool calls, so the caller can record the failure and carry on.
     """
+    if not isinstance(body, dict):
+        return _malformed({"unparseable_body": body}, None, None, None)
     input_tokens, output_tokens = _usage(body)
     message = _first_message(body)
     if message is None:
@@ -148,7 +150,7 @@ def _tool_call(raw: Any) -> ToolCall | None:
         return None
     try:
         arguments = json.loads(arguments_json)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(arguments, dict):
         return None

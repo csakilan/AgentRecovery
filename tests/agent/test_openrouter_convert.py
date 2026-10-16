@@ -1,3 +1,5 @@
+import copy
+
 from lab.agent.openrouter import parse_completion, to_openai_messages, to_openai_tools
 from lab.agent.tools import tool_schemas
 from lab.protocol.task import Profile
@@ -97,3 +99,43 @@ def test_parse_completion_marks_missing_choices_malformed():
     turn = parse_completion({"error": {"message": "upstream"}})
     assert turn.malformed is True
     assert turn.raw == {"error": {"message": "upstream"}}
+
+
+def test_converted_parameters_are_a_deep_copy_of_the_source_schema():
+    src = tool_schemas(Profile.CONTROLLED, status_available=True)
+    before = copy.deepcopy(src)
+    out = to_openai_tools(src)
+    charge = next(t for t in out if t["function"]["name"] == "charge")
+    charge["function"]["parameters"]["properties"]["injected"] = {"type": "string"}
+    assert src == before
+
+
+def test_non_dict_body_is_malformed_and_wrapped_under_raw():
+    for body in (["not", "a", "dict"], 42):
+        turn = parse_completion(body)
+        assert turn.malformed is True
+        assert turn.tool_calls == ()
+        assert turn.text is None
+        assert turn.raw == {"unparseable_body": body}
+
+
+def test_deeply_nested_arguments_are_malformed_without_raising():
+    body = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "x",
+                            "type": "function",
+                            "function": {"name": "charge", "arguments": "[" * 100000},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    turn = parse_completion(body)
+    assert turn.malformed is True
+    assert turn.tool_calls == ()
