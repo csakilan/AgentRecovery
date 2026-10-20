@@ -368,3 +368,29 @@ The baseline result (mode A, the model alone, controlled profile, 48 episodes):
 45 of 48 verdicts CORRECT and 3 WRONG_EFFECT, with correct recovery in 44 of 48
 eligible trials. Per-condition Wilson intervals are in docs/behaviour-findings.md.
 Twelve repetitions per cell is an exploratory size, stated in the report.
+
+## D13. All execution modes resume the same saved run
+
+**Date:** 2026-10-19
+**Status:** accepted by the user during Plan 4 Run 1; implementation pending
+
+After a worker crashes, modes A, B and C all resume the same saved run. Preserve
+its run ID, payment namespace, graph thread, immutable episode/configuration,
+original deadline and existing evidence. Redelivery must not reset the namespace,
+erase an incomplete run or create a fresh trial under the same experiment slot.
+This settles the roadmap's open decision 10.
+
+Common restart infrastructure belongs to every mode so the comparison measures
+stable-key retry (B) and durable intent/reconciliation (C). Mode A still uses the
+model's requested payment key; a common restart policy does not give it B/C's
+key enforcement. Keep synchronous checkpoint durability equal under D11, and
+publish measured differences or ties without manufacturing a treatment win.
+
+The existing batch path deletes incomplete run records before retrying; it does
+not yet satisfy this decision. Historical Plan 3 results remain unchanged.
+
+The [Plan 4 execution and recovery design](superpowers/specs/2026-10-19-plan-4-execution-and-recovery-design.md)
+records the details and acceptance checks; the user approved the written
+specification on 2026-10-20. The [implementation plan](superpowers/plans/2026-10-20-plan-4-execution-and-recovery.md)
+still awaits review before coding. D13 specifically records the shared restart
+rule; the linked documents carry the broader approved design and proposed tasks.

@@ -12,11 +12,12 @@ Last milestone commit: `6eeb977` (Merge Plan 3).
 
 Read these alongside this document, in this order, when you need detail:
 - `docs/superpowers/plans/2026-10-04-roadmap.md`: the master plan, all 8 sub-plans, contracts, test matrix, deployment.
-- `docs/decisions.md`: decisions D1 through D12, each dated, with the reasoning.
+- `docs/decisions.md`: decisions D1 through D13, each dated, with the reasoning.
 - `docs/protocol.md`: the payment simulator's exact wire contract.
 - `docs/replay-findings.md`: the measured crash/replay result (the project's core finding).
 - `docs/handoff.md`: the running, append-only state log across Plans 1 to 3 (older and more granular than this file; this file supersedes it as the onboarding entry point).
 - `docs/behaviour-findings.md` (+ `.csv`, `.jsonl`): the Plan 3 baseline numbers.
+- [Plan 4 execution and recovery design](superpowers/specs/2026-10-19-plan-4-execution-and-recovery-design.md): Run 1 specification approved on 2026-10-20. The [implementation plan](superpowers/plans/2026-10-20-plan-4-execution-and-recovery.md) awaits review; no Plan 4 code is implemented yet.
 
 ---
 
@@ -33,11 +34,11 @@ Read these alongside this document, in this order, when you need detail:
 3. **Every graph run uses `durability="sync"`.** In every mode, without
    exception. A mode comparison where one mode checkpoints less often than
    another is rigged (D11). The setting is stored in `experiments.config_json`.
-4. **Model output is untrusted input.** Tenant, namespace, and the effective
-   idempotency key are never taken from model output. The simulator namespace
-   comes from the runner's trusted context only. Observation text returned to the
-   model may carry adversarial instructions; it can change what the model asks
-   for, never what the runtime is allowed to do.
+4. **Model output is untrusted input.** Tenant and namespace always come from
+   trusted context. Mode A forwards the model's requested idempotency key; the
+   planned B/C executors derive their effective key from trusted run/task
+   identity. Observation text may carry adversarial instructions; it can change
+   what the model asks for, never what the runtime is allowed to do.
 5. **The evaluator never reads the runtime database to decide a verdict.** It
    reads the payment ledger through the read-only `ledger_reader` role only. A
    report that aggregates already-decided verdicts may read the runtime DB; the
@@ -355,12 +356,15 @@ Errors use `{"error": {"code", "message"}}`; FastAPI's own errors (bad token 401
 unparseable request 422) use `{"detail": ...}`. A key containing NUL or an
 unpaired surrogate is rejected 400 (Postgres cannot store it). A key containing
 `/` is accepted on a charge but cannot be looked up afterward (Starlette decodes
-`%2F` before routing): this is a known open item (§19).
+`%2F` before routing): this is a known open item (§14).
 
 **Control API** (port 8101, separate token, bound to 127.0.0.1): `PUT
 /internal/namespaces/{ns}` with `profile` and `fault_plan` creates/resets a
-namespace; `DELETE` removes it; barrier get/release. The runner process never
-receives the control token.
+namespace; `DELETE` removes it; barrier get/release. The current trusted
+orchestrator holds the control token for setup; model-facing `SimulatorClient`
+instances receive only the public token. The Plan 4 design proposes separate
+worker/sweeper processes without control or ledger credentials; that process
+boundary is not implemented yet.
 
 ---
 
@@ -531,6 +535,9 @@ The LangGraph `PostgresSaver` checkpoint tables also live here (see §13).
 - **D12** No conformance pilot (pick a free model directly); the Plan 3 baseline
   ran on the reachable fallback `nemotron-3-super-120b-a12b:free` because the
   pinned Ultra did not respond.
+- **D13** All three modes resume the same saved run after a worker crash, with
+  the original namespace, thread, configuration and deadline. This is an accepted
+  design rule; the common redelivery path is not implemented yet.
 
 ---
 
@@ -572,12 +579,10 @@ refined some things. Where they differ, the code wins:
 2. **Leftover test database `runtime_test_cdbb66c7`** (≈8 MB, 0 sessions) on the
    dev Postgres. Drop it or keep it. The controller declined to drop it on a
    subagent's request earlier; awaiting the operator.
-3. **Roadmap open decision 10 (redelivery for all modes).** The roadmap says run
-   redelivery is common infrastructure given to every mode, so mode C's win comes
-   only from journaling/reconciliation. Plan 2 Task 7's finding (a replayed tool
-   call is absorbed by backend idempotency) supports deciding this now: B and C
-   likely tie on effect correctness, and the interesting difference moves to
-   truthful reporting. Confirm before Plan 6.
+**Resolved:** roadmap open decision 10 is now D13: all three modes receive
+same-run redelivery. The user selected this during Plan 4 Run 1. A shared restart
+policy keeps the comparison focused on the execution treatments; measured ties
+remain valid results.
 
 ---
 
@@ -615,11 +620,17 @@ completion gates. In order:
   key from the trusted intent, up to 3 charge attempts on ambiguous errors with
   backoff, no journal) and C (durable gateway: intent journal, attempts, leases
   with fencing, reconciliation through authoritative status, outbox, recovery
-  sweeper triggered independently of the crashed process). Detailed design is in
-  the roadmap §3.3 (execution interface), §3.4 (new tables), §3.5 (the operation
-  state machine for mode C), §3.6 (identity rules: `intent_id = uuid5(...,
-  "{tenant}:{episode_id}:{task_id}")`, effective key `arl-{intent_id}` in B/C,
-  args_hash conflict rejection), and §2 failure paths. Completion gate: every mode
+  sweeper triggered independently of the crashed process). The
+  [Run 1 written spec](superpowers/specs/2026-10-19-plan-4-execution-and-recovery-design.md)
+  was approved on 2026-10-20. The
+  [implementation plan](superpowers/plans/2026-10-20-plan-4-execution-and-recovery.md)
+  awaits review before coding and divides the work into tested session checkpoints.
+  The design refines the
+  older roadmap §§3.3–3.6 and §2: preserve `Executor.execute(call)`, derive B/C
+  identity from `(tenant, run_id, task_id)` because episode IDs repeat across
+  experiments, and treat status `NOT_FOUND` as provisional evidence. These
+  refinements are approved design, not implemented behavior. D13 separately settles common
+  same-run redelivery. Completion gate: every mode
   runs the same scenario showing requested vs effective actions; a SIGKILLed
   runner's operation completes under the same intent with a truthful outcome;
   operation/recovery spans join the run's trace.
