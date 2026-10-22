@@ -7,7 +7,7 @@ it says "see X", X is an authoritative file in the repo with more depth.
 
 Repository: https://github.com/csakilan/AgentRecovery.git
 Working tree on the original machine: `/Users/ak/Documents/Pro/VSWorkspace/Projects/AgentRecovery`
-Default branch: `main`. All of Plans 1, 2 and 3 are merged to `main`.
+Default branch: `main`. Plans 1–3 and the Plan 4 Tasks 1–7 checkpoint are on `main`.
 Last milestone commit: `6eeb977` (Merge Plan 3).
 
 Read these alongside this document, in this order, when you need detail:
@@ -17,7 +17,7 @@ Read these alongside this document, in this order, when you need detail:
 - `docs/replay-findings.md`: the measured crash/replay result (the project's core finding).
 - `docs/handoff.md`: the running, append-only state log across Plans 1 to 3 (older and more granular than this file; this file supersedes it as the onboarding entry point).
 - `docs/behaviour-findings.md` (+ `.csv`, `.jsonl`): the Plan 3 baseline numbers.
-- [Plan 4 execution and recovery design](superpowers/specs/2026-10-19-plan-4-execution-and-recovery-design.md): Run 1 specification approved on 2026-10-20. The [implementation plan](superpowers/plans/2026-10-20-plan-4-execution-and-recovery.md) awaits review; no Plan 4 code is implemented yet.
+- [Plan 4 execution and recovery design](superpowers/specs/2026-10-19-plan-4-execution-and-recovery-design.md): Run 1 specification approved on 2026-10-20. The [implementation plan](superpowers/plans/2026-10-20-plan-4-execution-and-recovery.md) was approved for direct execution on 2026-10-20. Run 3 Tasks 1–7 are implemented; production runner integration remains mode A only.
 
 ---
 
@@ -36,7 +36,7 @@ Read these alongside this document, in this order, when you need detail:
    another is rigged (D11). The setting is stored in `experiments.config_json`.
 4. **Model output is untrusted input.** Tenant and namespace always come from
    trusted context. Mode A forwards the model's requested idempotency key; the
-   planned B/C executors derive their effective key from trusted run/task
+   B/C executors derive their effective key from trusted run/task
    identity. Observation text may carry adversarial instructions; it can change
    what the model asks for, never what the runtime is allowed to do.
 5. **The evaluator never reads the runtime database to decide a verdict.** It
@@ -108,11 +108,20 @@ The evaluation is **baseline and treatment**, not a three-way survey:
 
 ---
 
-## 2. Current status (as built, 2026-10-18)
+## 2. Current status (as built, 2026-10-21)
 
 - **Plans 1, 2, 3 are complete and merged to `main`.** Plans 4 through 8 remain.
-- **Test suite: 1016 passing**, ruff clean (line length 100). `uv run pytest -q`.
-- **Code:** ~4,500 lines under `src/lab`, ~11,750 lines of tests under `tests`.
+- **Test suite: 1,172 passing** on 2026-10-21 (85.32s, no warnings); ruff lint and
+  formatting clean (124 files). Run 3 adds 49 tests to Run 2's 1,123. Baseline
+  before Run 2: 1,016 tests. No real model requests.
+- **Plan 4 Run 3 checkpoint:** Tasks 1–7 implemented and verified on
+  `main`, with `plan-4-durable-gateway` retained for the remaining Plan 4 work.
+  B and C's normal path work through
+  scripted graphs and the real simulator. Saved preparation, run ownership,
+  atomic checkpoint fencing and invocation evidence are available as foundations.
+  Production `run_spec` still enables only A until Task 10; the sweeper, durable
+  wake-ups, common redelivery and final SIGKILL acceptance remain pending.
+- **Code:** 6,438 Python lines under `src/lab`, 13,826 under `tests`.
 - **The baseline number exists** (`docs/behaviour-findings.md`): the model alone
   (mode A, controlled profile), 48 episodes, 45 of 48 CORRECT and 3 WRONG_EFFECT,
   correct recovery in 44 of 48 eligible trials. It ran on
@@ -256,17 +265,46 @@ Source both for a real run: `set -a; . ./.env.example; . ./.env; set +a`.
   model-facing tool text is produced; delegates to `protocol/render.py` for sent
   requests so compat parity holds).
 - `graph.py`: `EpisodeState` (TypedDict: messages, turn, claimed_outcome, done,
-  ended_by), `build_graph(model, executor, tools, max_turns, *, recorder,
-  checkpointer)`, `run_episode(graph, thread_id, messages=None, *,
+  ended_by, optional model_invocation_id), `build_graph(model, executor, tools,
+  max_turns, *, recorder, checkpointer, invocations=None, guard=None)`, `run_episode(graph, thread_id, messages=None, *,
   durability="sync", allow_non_sync=False)`. Two nodes (model, tool), conditional
   edge, ends on `report_done` or `max_turns`. The recorder writes `model_calls`
   and `tool_events` rows immediately on an autocommit connection so a SIGKILL
-  leaves the evidence written.
+  leaves the evidence written. New-version callers opt into ASCII-encoded
+  recorder evidence and retain each model invocation separately; legacy
+  first-response snapshots are unchanged.
 - `openrouter.py`: `to_openai_tools`, `to_openai_messages`, `parse_completion`
   (pure conversions), `OpenRouterClient` (the real `ModelClient`: retry/backoff on
   429/5xx/transport honoring Retry-After, rate-limit pacing via `min_interval_s`,
   `:free` refusal, once-per-request `RequestBudget.claim`, never raises on a bad
   response body), `OpenRouterError`. `STUDY_MODELS` lives in `runner/batch.py`.
+
+**`execution/`: retry and durable C foundations (Runs 2–3)**
+- `identity.py`: UUID5 identity from trusted `(tenant, run_id, task_id)` and B/C's
+  effective key; changing a model-requested key does not change this identity.
+- `config.py`, `clock.py`: frozen versioned limits, injectable time/deadline checks
+  and guard protocols. These settings and the HTTP timeout are saved in experiment
+  configuration; each operation retains its first settings and bounded deadline.
+- `retry.py`: `RetryExecutor`, at most three charge sends per tool invocation,
+  waits of 1/2 seconds, stable key and original arguments, no journal. Valid status
+  calls map to that key. Invalid source arguments retain the original refusal path.
+- `outcomes.py`: fixed uncertainty/recovery text; `ToolOutcome` has optional
+  execution evidence, now persisted in `tool_events.execution_json`.
+- `protocol/validation.py` now owns the unchanged simulator validation contract;
+  `protocol/evidence.py` provides lossless versioned ASCII storage envelopes,
+  connected through opt-in versioned recording; old rows retain their old shape.
+
+- `types.py`, `journal.py`: immutable intent snapshots; first valid arguments win,
+  conflicting arguments append a denial, and intended attempts commit before HTTP.
+  Operation leases fence changes; terminal state and one outbox event commit together.
+- `leases.py`: independently renewed heartbeat with failure detection.
+- `reconcile.py`, `gateway.py`, `factory.py`: normal C success/refusal, cached
+  outcomes and conservative UNKNOWN/UNRESOLVED handling. Status-based recovery
+  belongs to Run 4; production runner integration belongs to Run 5. A foreground
+  timeout leaves another live operation owner intact and reports uncertainty.
+- `agent/invocations.py`: one row per actual logical model invocation, including
+  repeated turns. Its full normalized response includes raw data and text. A late
+  response can finish its own audit row but cannot save stale graph state.
 
 **`runtime/`: the runtime database and the budget guard (runs as `runtime_svc`)**
 - `db.py`: `runtime_url()` from `LAB_RUNTIME_URL`.
@@ -279,9 +317,26 @@ Source both for a real run: `set -a; . ./.env.example; . ./.env; set +a`.
 - `__main__.py`: `python -m lab.runtime migrate`.
 - `migrations/`: `0001_init` (experiments, runs, model_calls, tool_events,
   crash_points, results, request_budget + grants), `0002_restrict_connect`,
-  `0003_run_score_failed` (adds the `score_failed` run state).
+  `0003_run_score_failed` (adds the `score_failed` run state),
+  `0004_execution_recovery` (saved resume inputs, run claims, operations, attempts,
+  recovery events, outbox, model invocations and run deliveries). This migration
+  is additive; it does not invent resume metadata for historical records.
+- `fenced_checkpoints.py`: a dedicated saver connection checks and locks the run
+  owner in the same transaction as checkpoint/blob/pending-write changes, then
+  rechecks expiry before commit. It is restricted to the owned graph thread.
+- `serde.py`: preserves unpaired surrogates in JSON-native graph values using
+  the existing ASCII codec and a saver-controlled blob tag. Other values use
+  the pinned library serializer unchanged. This prevents silent replacement
+  with `?` when new-version graphs resume.
 
-**`runner/`: wires one episode end to end**
+**`runner/`: preparation, ownership and existing A orchestration**
+- `types.py`, `prepared.py`: reconstructible nonsecret model descriptions, safe
+  worker inputs and immutable run preparation. Save pending metadata before
+  create-only setup; retry without deleting payments or fault-call position.
+  Worker-facing loads explicitly exclude hidden setup/scoring input.
+- `ownership.py`: shared A/B/C claims, renewal, guards and fenced finalization.
+  Only new-version ready runs can be claimed. The production runner switches
+  to this shared path in Task 10.
 - `episode.py`: `RunnerConfig(.from_env)`, `run_spec(spec, model, config, *,
   manifest_sha256, experiment_name, experiment_id=None)` → `EpisodeResult`.
   Configures the namespace via the control API, derives `TrustedContext`, builds
@@ -552,18 +607,20 @@ refined some things. Where they differ, the code wins:
    `PostgresSaver` tables in `runtime`, created as admin at migrate time and
    granted to `runtime_svc` (`src/lab/runtime/checkpoints.py`). If Plan 4/8 want a
    separate checkpoints DB, that is a migration not yet done.
-2. **The Plan 4 runtime tables do not exist yet.** `operations`, `attempts`,
-   `recovery_events`, `outbox` are roadmap-proposed (§3.4) and are Plan 4's first
-   migration. Only `experiments`, `runs`, `model_calls`, `tool_events`,
-   `crash_points`, `results`, `request_budget` exist today.
-3. **`runs` does not yet have the mode-C columns** (`claim_owner`,
-   `lease_expires_at`, `version`, `delivery_count` beyond the default). Plan 4 adds
-   them.
+2. **Plan 4's additive runtime schema is implemented.** Migration 0004 adds
+   the durable journal, invocations, outbox and delivery table. Outbox dispatch
+   and the delivery APIs remain pending; a table alone is not a completed queue.
+3. **Shared run ownership and checkpoint fencing are implemented as foundations.**
+   Production graph redelivery is still pending Task 10. Historical runs have
+   null resume metadata and refuse same-run execution without guessed inputs.
 4. **`TrustedContext.task_id` is a free `str`** in the code
    (`src/lab/agent/client.py`), not the `Literal["charge"]` the roadmap sketch
    shows. The runner sets it to `f"charge-order-{order_id}"`.
-5. **Only mode A (`agent_directed`) is implemented.** `run_spec` refuses the other
-   two modes with an error naming Plan 4. Modes B and C are Plan 4.
+5. **Only mode A (`agent_directed`) is wired into `run_spec`.** Run 2 implemented
+   the standalone B executor and verified it through scripted graphs and the real
+   simulator. `run_spec` still refuses B/C until Task 10 adds safe setup/resume.
+   C's normal path and durable tables are now tested standalone; background
+   reconciliation and production integration remain pending.
 6. **The conformance pilot was dropped (D12).** The behaviour baseline is on the
    120B fallback model, not Nemotron Ultra (which was unreachable). If you want an
    Ultra baseline, re-run `study` when its free endpoint responds; it becomes its
@@ -624,12 +681,16 @@ completion gates. In order:
   [Run 1 written spec](superpowers/specs/2026-10-19-plan-4-execution-and-recovery-design.md)
   was approved on 2026-10-20. The
   [implementation plan](superpowers/plans/2026-10-20-plan-4-execution-and-recovery.md)
-  awaits review before coding and divides the work into tested session checkpoints.
+  was approved for direct execution and divides the work into tested session checkpoints.
+  Run 2 added trusted identity, shared validation/settings and B. Run 3 adds
+  durable intent, normal C execution, safe preparation, ownership/checkpoint
+  fencing and model replay evidence. Runs 4–6 add the sweeper, delivery/worker/CLI
+  integration and actual process-kill acceptance.
   The design refines the
   older roadmap §§3.3–3.6 and §2: preserve `Executor.execute(call)`, derive B/C
   identity from `(tenant, run_id, task_id)` because episode IDs repeat across
   experiments, and treat status `NOT_FOUND` as provisional evidence. These
-  refinements are approved design, not implemented behavior. D13 separately settles common
+  identity is implemented; status reconciliation remains planned for Run 4. D13 separately settles common
   same-run redelivery. Completion gate: every mode
   runs the same scenario showing requested vs effective actions; a SIGKILLed
   runner's operation completes under the same intent with a truthful outcome;

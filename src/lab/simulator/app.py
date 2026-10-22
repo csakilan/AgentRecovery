@@ -106,9 +106,21 @@ def create_internal_app(pool: ConnectionPool, control_token: str) -> FastAPI:
     auth = [Depends(_bearer(control_token))]
 
     @app.put("/internal/namespaces/{namespace}", dependencies=auth)
-    def put_namespace(namespace: str, config: NamespaceConfig) -> dict[str, str]:
+    def put_namespace(
+        namespace: str, config: NamespaceConfig, if_none_match: str | None = Header(default=None)
+    ) -> dict[str, str]:
         with pool.connection() as conn:
-            service.configure_namespace(conn, namespace, config.profile, config.fault_plan)
+            try:
+                configure = (
+                    service.configure_namespace_once
+                    if if_none_match == "*"
+                    else service.configure_namespace
+                )
+                configure(conn, namespace, config.profile, config.fault_plan)
+            except service.NamespaceConfigConflict:
+                raise HTTPException(
+                    status_code=409, detail="namespace configuration differs"
+                ) from None
         return {"namespace": namespace}
 
     @app.delete("/internal/namespaces/{namespace}", dependencies=auth)

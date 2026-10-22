@@ -50,6 +50,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 import uuid
@@ -63,6 +64,7 @@ from urllib.parse import quote
 import httpx
 import psycopg
 from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg.rows import tuple_row
 from psycopg.types.json import Jsonb
 
 from lab import obs
@@ -72,10 +74,12 @@ from lab.agent.graph import EpisodeState, PostgresRecorder, build_graph, run_epi
 from lab.agent.model import ModelClient
 from lab.agent.prompts import PROMPT_VERSION, system_prompt, user_prompt
 from lab.agent.tools import TOOL_SCHEMA_VERSION, tool_schemas
+from lab.execution.config import ExecutionConfig
 from lab.oracle import EVALUATOR_VERSION
 from lab.oracle.ledger import read_ledger
 from lab.oracle.score import EpisodeScore, Expectation, score_episode
 from lab.protocol.manifest import EpisodeSpec, Mode
+from lab.runner.types import ModelDescriptor
 
 # D11: every mode checkpoints with "sync", so no mode is favoured by weaker checkpointing.
 # A constant, not a setting: nothing in this module can pass anything else.
@@ -139,13 +143,18 @@ class RunnerConfig:
     max_turns: int = 10
     episode_deadline_s: float = 300.0
     http_timeout_s: float = 30.0
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
     def __post_init__(self) -> None:
         if not self.tenant:
             raise ConfigError("tenant must not be empty")
         if self.max_turns < 1:
             raise ConfigError(f"max_turns must be at least 1, got {self.max_turns}")
-        if self.episode_deadline_s < 0:
+        if not math.isfinite(self.http_timeout_s) or self.http_timeout_s <= 0:
+            raise ConfigError("http_timeout_s must be finite and positive")
+        if not isinstance(self.execution, ExecutionConfig):
+            raise ConfigError("execution must be an ExecutionConfig")
+        if not math.isfinite(self.episode_deadline_s) or self.episode_deadline_s < 0:
             raise ConfigError(f"episode_deadline_s must not be negative: {self.episode_deadline_s}")
 
     @classmethod
@@ -193,13 +202,24 @@ class EpisodeResult:
     score: EpisodeScore
 
 
-def experiment_config(model_id: str, config: RunnerConfig, manifest_sha256: str) -> dict[str, Any]:
+def experiment_config(
+    model_id: str,
+    config: RunnerConfig,
+    manifest_sha256: str,
+    *,
+    model_descriptor: ModelDescriptor | None = None,
+) -> dict[str, Any]:
     """The `experiments.config_json` of a run: everything that changes what is measured.
 
     Durability sits beside the model id and the prompt version, as the plan's global
     constraint requires."""
     return {
         "durability": DURABILITY,
+        "execution": config.execution.model_dump(mode="json"),
+        "http_timeout_s": config.http_timeout_s,
+        "model_descriptor": (
+            model_descriptor or ModelDescriptor(kind="injected", model_id=model_id)
+        ).model_dump(mode="json"),
         "model_id": model_id,
         "prompt_version": PROMPT_VERSION,
         "tool_schema_version": TOOL_SCHEMA_VERSION,
@@ -250,10 +270,11 @@ def ensure_experiment(
         " VALUES (%s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
         (experiment_id, name, manifest_sha256, Jsonb(dict(cfg))),
     )
-    row = conn.execute(
-        "SELECT name, manifest_sha256, config_json FROM experiments WHERE id = %s",
-        (experiment_id,),
-    ).fetchone()
+    with conn.cursor(row_factory=tuple_row) as cur:
+        row = cur.execute(
+            "SELECT name, manifest_sha256, config_json FROM experiments WHERE id = %s",
+            (experiment_id,),
+        ).fetchone()
     assert row is not None
     stored = {"name": row[0], "manifest_sha256": row[1], "config": row[2]}
     wanted = {"name": name, "manifest_sha256": manifest_sha256, "config": dict(cfg)}
@@ -466,7 +487,11 @@ def run_spec(
             f"{Mode.AGENT_DIRECTED.value!r} executor; the other modes arrive in Plan 4"
         )
 
-    cfg = experiment_config(model.model_id, config, manifest_sha256)
+    from lab.runner.prepared import describe_model
+
+    cfg = experiment_config(
+        model.model_id, config, manifest_sha256, model_descriptor=describe_model(model)
+    )
     experiment = experiment_id or derive_experiment_id(experiment_name, cfg)
     run_token = _new_run_token()
     run_id = f"run-{run_token}"

@@ -60,7 +60,11 @@ def run_manifest(
     experiment_name: str,
 ) -> BatchSummary:
     manifest_sha256 = manifest.sha256()
-    cfg = experiment_config(model.model_id, config, manifest_sha256)
+    from lab.runner.prepared import describe_model
+
+    cfg = experiment_config(
+        model.model_id, config, manifest_sha256, model_descriptor=describe_model(model)
+    )
     experiment_id = derive_experiment_id(experiment_name, cfg)
 
     completed = skipped = failed = 0

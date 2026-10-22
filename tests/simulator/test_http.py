@@ -51,6 +51,39 @@ def test_lost_ack_end_to_end(apps):
     assert status.json()["status"] == "SUCCEEDED"
 
 
+def test_create_only_setup_preserves_effect_and_rejects_conflict(apps, svc_url):
+    public, internal = apps
+    headers = {**CONTROL, "If-None-Match": "*"}
+    body = {"profile": "controlled", "fault_plan": {}}
+    assert internal.put("/internal/namespaces/once", headers=headers, json=body).status_code == 200
+    assert (
+        public.post(
+            "/v1/charges", headers={**CLIENT, "X-Lab-Namespace": "once"}, json=CHARGE
+        ).status_code
+        == 200
+    )
+    with psycopg.connect(svc_url, autocommit=True) as conn:
+        before = read_ledger(conn, "once")
+        assert (
+            internal.put("/internal/namespaces/once", headers=headers, json=body).status_code == 200
+        )
+        assert (
+            internal.put(
+                "/internal/namespaces/once", headers=headers, json={"profile": "compat"}
+            ).status_code
+            == 409
+        )
+        assert read_ledger(conn, "once") == before
+    # Existing callers explicitly retain reset semantics without the header.
+    assert internal.put("/internal/namespaces/once", headers=CONTROL, json=body).status_code == 200
+    assert (
+        public.get("/v1/payments/k1", headers={**CLIENT, "X-Lab-Namespace": "once"}).json()[
+            "status"
+        ]
+        == "NOT_FOUND"
+    )
+
+
 def test_public_requires_the_client_token(apps):
     public, internal = apps
     configure(internal, "ns")

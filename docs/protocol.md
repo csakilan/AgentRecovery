@@ -238,3 +238,11 @@ effects, call counts and invalid calls in a single statement as the `ledger_read
 so they always agree. Charge effects and charge attempts are ordered by call index, the
 order their slots were claimed. Call indexes are per endpoint, so the oracle promises no
 order between charge calls and status calls.
+
+### Create-only namespace preparation
+
+`PUT /internal/namespaces/{namespace}` with `If-None-Match: *` creates the
+namespace once. An identical profile and fault plan returns 200 without resetting
+payments, call counts or barriers. A conflicting configuration returns 409.
+Without this header the existing reset behavior is unchanged. Only the internal
+control API accepts setup; workers still use the public API exclusively.

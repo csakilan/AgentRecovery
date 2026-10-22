@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import copy
 import time
-from typing import Any, Literal, Protocol, TypedDict, get_args
+from typing import Any, Literal, NotRequired, Protocol, TypedDict, get_args
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -40,8 +40,11 @@ from lab.agent.executor import (
     ToolOutcome,
     not_sent_outcome,
 )
+from lab.agent.invocations import InvocationJournal
 from lab.agent.model import ModelClient, ModelTurn, ToolCall
+from lab.execution.clock import BoundaryGuard
 from lab.obs import NO_TRACE, EpisodeTrace
+from lab.protocol.evidence import pack_evidence, pack_text
 
 REPORT_DONE = "report_done"
 
@@ -49,6 +52,7 @@ EndedBy = Literal["report_done", "max_turns"]
 
 
 class EpisodeState(TypedDict):
+    model_invocation_id: NotRequired[str]
     messages: list[dict[str, Any]]
     turn: int
     claimed_outcome: str | None
@@ -70,7 +74,9 @@ class Recorder(Protocol):
         latency_ms: float,
     ) -> None: ...
 
-    def record_tool_event(self, *, turn: int, tool: str, outcome: ToolOutcome) -> None: ...
+    def record_tool_event(
+        self, *, turn: int, tool: str, outcome: ToolOutcome, model_invocation_id: str | None = None
+    ) -> None: ...
 
 
 class PostgresRecorder:
@@ -80,13 +86,22 @@ class PostgresRecorder:
     it is written and survives a SIGKILL of this process. It is the caller's to close.
     """
 
-    def __init__(self, conn: Connection[Any], run_id: str) -> None:
+    def __init__(
+        self, conn: Connection[Any], run_id: str, *, encoded_evidence: bool = False
+    ) -> None:
         if not conn.autocommit:
             raise ValueError(
                 "the recorder needs an autocommit connection so rows survive a killed process"
             )
         self._conn = conn
         self._run_id = run_id
+        self._encoded = encoded_evidence
+
+    def _json(self, value):
+        return Jsonb(pack_evidence(value) if self._encoded else value)
+
+    def _text(self, value):
+        return pack_text(value) if self._encoded and value is not None else value
 
     def record_model_call(
         self,
@@ -114,9 +129,9 @@ class PostgresRecorder:
                 self._run_id,
                 turn,
                 provider_model_id,
-                Jsonb({"messages": messages, "tools": tools}),
-                Jsonb(result.raw),
-                Jsonb([call.model_dump() for call in result.tool_calls]),
+                self._json({"messages": messages, "tools": tools}),
+                self._json(result.raw),
+                self._json([call.model_dump() for call in result.tool_calls]),
                 result.input_tokens,
                 result.output_tokens,
                 latency_ms,
@@ -124,24 +139,31 @@ class PostgresRecorder:
             ),
         )
 
-    def record_tool_event(self, *, turn: int, tool: str, outcome: ToolOutcome) -> None:
+    def record_tool_event(
+        self, *, turn: int, tool: str, outcome: ToolOutcome, model_invocation_id: str | None = None
+    ) -> None:
         """Append one row. No conflict handling: a re-executed tool node must leave a second
         row, because the repeat is what the experiment looks for."""
         self._conn.execute(
             "INSERT INTO tool_events (run_id, turn, tool, requested_args_json, requested_key,"
-            " effective_args_json, effective_key, rule, observation, http_status)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            " effective_args_json, effective_key, rule, observation, "
+            "http_status,execution_json,model_invocation_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s,%s)",
             (
                 self._run_id,
                 turn,
-                tool,
-                Jsonb(outcome.requested_args),
-                outcome.requested_key,
-                None if outcome.effective_args is None else Jsonb(outcome.effective_args),
-                outcome.effective_key,
+                self._text(tool),
+                self._json(outcome.requested_args),
+                self._text(outcome.requested_key),
+                None if outcome.effective_args is None else self._json(outcome.effective_args),
+                self._text(outcome.effective_key),
                 outcome.rule,
-                outcome.observation,
+                self._text(outcome.observation),
                 outcome.http_status,
+                Jsonb(outcome.evidence.model_dump(mode="json"))
+                if outcome.evidence is not None
+                else None,
+                model_invocation_id,
             ),
         )
 
@@ -160,6 +182,8 @@ def build_graph(
     recorder: Recorder,
     checkpointer: BaseCheckpointSaver,
     trace: EpisodeTrace = NO_TRACE,
+    invocations: InvocationJournal | None = None,
+    guard: BoundaryGuard | None = None,
 ) -> Any:
     """Compile the loop. `tools` is the schema list passed to every `model.complete` call.
 
@@ -175,12 +199,32 @@ def build_graph(
         raise ValueError(f"max_turns must be at least 1, got {max_turns}")
 
     def model_node(state: EpisodeState) -> dict[str, Any]:
+        if guard is not None:
+            guard.check()
         turn = state["turn"]
         messages = state["messages"]
+        invocation_id = (
+            invocations.start(
+                turn=turn, provider_model_id=model.model_id, messages=messages, tools=tools
+            )
+            if invocations is not None
+            else None
+        )
         with trace.model_call(model_id=model.model_id, turn=turn) as span:
             started = time.perf_counter()
-            result = model.complete(copy.deepcopy(messages), copy.deepcopy(tools))
+            try:
+                if guard is not None:
+                    guard.check()
+                result = model.complete(copy.deepcopy(messages), copy.deepcopy(tools))
+            except Exception as exc:
+                if invocations is not None:
+                    invocations.fail(
+                        invocation_id, type(exc).__name__, (time.perf_counter() - started) * 1000
+                    )
+                raise
             latency_ms = (time.perf_counter() - started) * 1000
+            if invocations is not None:
+                invocations.finish(invocation_id, result, latency_ms)
             span.record_usage(result.input_tokens, result.output_tokens)
         recorder.record_model_call(
             turn=turn,
@@ -190,12 +234,17 @@ def build_graph(
             result=result,
             latency_ms=latency_ms,
         )
+        if guard is not None:
+            guard.check()
         assistant = {
             "role": "assistant",
             "content": result.text,
             "tool_calls": [call.model_dump() for call in result.tool_calls],
         }
-        return {"messages": [*messages, assistant], "turn": turn + 1}
+        update = {"messages": [*messages, assistant], "turn": turn + 1}
+        if invocation_id is not None:
+            update["model_invocation_id"] = invocation_id
+        return update
 
     def tool_node(state: EpisodeState) -> dict[str, Any]:
         turn = state["turn"] - 1  # the model call that requested these tool calls
@@ -203,6 +252,8 @@ def build_graph(
         done = False
         claimed: str | None = None
         for raw in messages[-1]["tool_calls"]:
+            if guard is not None:
+                guard.check()
             call = ToolCall(**raw)
             with trace.tool_call(tool=call.name, call_id=call.id, turn=turn) as span:
                 if done:
@@ -214,7 +265,12 @@ def build_graph(
                 else:
                     outcome = executor.execute(call)
                 span.record_tool_outcome(outcome.rule, outcome.http_status)
-            recorder.record_tool_event(turn=turn, tool=call.name, outcome=outcome)
+            invocation_arg = (
+                {"model_invocation_id": state.get("model_invocation_id")}
+                if invocations is not None
+                else {}
+            )
+            recorder.record_tool_event(turn=turn, tool=call.name, outcome=outcome, **invocation_arg)
             messages.append(
                 {
                     "role": "tool",
@@ -223,6 +279,8 @@ def build_graph(
                     "content": outcome.observation,
                 }
             )
+        if guard is not None:
+            guard.check()
         update: dict[str, Any] = {"messages": messages}
         if done:
             update.update(claimed_outcome=claimed, done=True, ended_by="report_done")

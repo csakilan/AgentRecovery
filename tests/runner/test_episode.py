@@ -714,7 +714,7 @@ def test_a_scoring_failure_leaves_a_score_failed_run_that_rescore_run_finishes(
     with pytest.raises(EpisodeAlreadyRunError):
         run_spec(
             spec,
-            ScriptedModel("stable_key"),
+            model,
             runner_config,
             manifest_sha256=SHA,
             experiment_name=NAME,
@@ -959,8 +959,9 @@ def test_run_is_complete_is_false_for_a_crashed_run_and_true_for_a_scored_one(ru
     assert run_is_complete(rt, experiment_id, "no-such-episode") is False
 
     scored = run("stable_key", World.TRUE_FAIL, runner_config)
-    assert scored.experiment_id == experiment_id
-    assert run_is_complete(rt, experiment_id, scored.episode_id) is True
+    # A reconstructible scripted model has a different saved descriptor from Falls.
+    assert scored.experiment_id != experiment_id
+    assert run_is_complete(rt, scored.experiment_id, scored.episode_id) is True
 
 
 def test_clear_incomplete_run_deletes_a_crashed_run_but_never_a_completed_one(runner_config, rt):

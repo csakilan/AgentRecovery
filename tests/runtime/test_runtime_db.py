@@ -28,6 +28,12 @@ RUNTIME_TABLES = {
     "crash_points",
     "results",
     "request_budget",
+    "operations",
+    "attempts",
+    "recovery_events",
+    "outbox",
+    "model_invocations",
+    "run_deliveries",
 }
 TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
 

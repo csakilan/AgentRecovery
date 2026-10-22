@@ -8,6 +8,7 @@ the real public app and a throwaway database, to show where a charge and a statu
 import dataclasses
 import inspect
 import json
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -25,6 +26,66 @@ from lab.agent.client import (
 )
 from lab.simulator.app import create_internal_app, create_public_app
 from tests.helpers import CHARGE, charges
+
+
+def test_optional_execution_bounds_limit_each_request_without_widening_client_timeout():
+    from lab.execution.clock import DeadlineBudget, NoopGuard
+    from tests.execution.helpers import FakeClock
+
+    clock = FakeClock()
+    budget = DeadlineBudget(clock.now() + timedelta(seconds=2), clock)
+    seen = []
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda r: (seen.append(r), httpx.Response(200, json={}))[1]),
+        timeout=httpx.Timeout(0.25, read=10),
+    ) as http:
+        client = SimulatorClient(
+            "http://sim",
+            "t",
+            CTX,
+            http_client=http,
+            guard=NoopGuard(),
+            remaining_s=budget.remaining_s,
+        )
+        client.charge(CHARGE)
+        clock.advance(1)
+        client.status("k1")
+    assert seen[0].extensions["timeout"] == {
+        "connect": 0.25,
+        "read": 2.0,
+        "write": 0.25,
+        "pool": 0.25,
+    }
+    assert seen[1].extensions["timeout"]["read"] == 1
+
+
+def test_unbounded_client_keeps_injected_timeout_and_bounded_view_does_not_own_it():
+    from lab.execution.clock import NoopGuard
+
+    client, seen = make_client()
+    client.status("k1")
+    assert set(seen[0].extensions["timeout"].values()) == {5.0}
+    bounded = client.with_bounds(NoopGuard(), lambda: 1.0)
+    bounded.status("k1")
+    bounded.close()
+    client.status("k1")
+    assert len(seen) == 3
+    assert set(seen[1].extensions["timeout"].values()) == {1.0}
+
+
+def test_bounded_view_preserves_an_existing_ownership_guard():
+    from lab.execution.clock import NoopGuard
+
+    class Refuse:
+        def check(self):
+            raise RuntimeError("stale owner")
+
+    client, seen = make_client(guard=Refuse())
+    bounded = client.with_bounds(NoopGuard(), lambda: 3.0)
+    with pytest.raises(RuntimeError, match="stale owner"):
+        bounded.status("k")
+    assert seen == []
+
 
 TOKEN = "client-t"
 CONTROL = {"Authorization": "Bearer control-t"}

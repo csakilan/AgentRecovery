@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.12+, uv, psycopg 3 and hand-written PostgreSQL SQL; existing FastAPI/httpx, LangGraph 1.2.14, checkpoint-postgres 3.1.2 and OpenTelemetry 1.45.0; pytest and ruff. No new dependencies.
 
-**Spec:** [Execution and recovery design](../specs/2026-10-19-plan-4-execution-and-recovery-design.md), approved by the user's “Continue working” instruction on 2026-10-20. D13 settles shared same-run redelivery. This implementation plan still awaits review; no product code is included in Run 1.
+**Spec:** [Execution and recovery design](../specs/2026-10-19-plan-4-execution-and-recovery-design.md), approved by the user's “Continue working” instruction on 2026-10-20. D13 settles shared same-run redelivery. The user approved direct execution with “lets go” on 2026-10-20. Run 2 implements Tasks 1–2; no product code was included in Run 1.
 
 ## Global Constraints
 
@@ -41,7 +41,7 @@ Base is `ae76be5`; current branch is `plan-4-durable-gateway`. The untracked `.D
 | `src/lab/execution/{__init__,identity,config,clock,outcomes,retry}.py` | Identity, settings, bounded waits, new observations and B (1–2) |
 | `src/lab/runtime/migrations/0004_execution_recovery.sql` | Additive run, journal, invocation and delivery schema (3) |
 | `src/lab/execution/{types,journal}.py` | Operation records and fenced transactions (3, 6) |
-| `src/lab/runner/{types,prepared,ownership}.py`; `runtime/fenced_checkpoints.py` | Immutable prepared runs and common ownership (4–5) |
+| `src/lab/runner/{types,prepared,ownership}.py`; `runtime/{fenced_checkpoints,serde}.py` | Immutable prepared runs and common ownership (4–5) |
 | `src/lab/execution/{gateway,reconcile,leases,factory}.py` | C executor, evidence classification and recovery work (6, 8) |
 | `src/lab/agent/invocations.py`; existing `agent/graph.py` | Preserve every logical model invocation (7) |
 | `src/lab/execution/outbox.py`; `runner/deliveries.py` | Terminal events and durable run wake-ups (9) |
@@ -97,7 +97,7 @@ Use existing renderers for actual charge responses and ordinary model-requested 
 
 **Interfaces:** Consume `TrustedContext`, `Profile`, `parse_amount`, `args_hash` and the existing validation responses. Produce the identity/config/clock contracts above. Produce frozen `ValidCharge(key: str, order_id: str | None, amount: Decimal, currency: str | None)`, `ChargeRefusal(http_status: int, body: dict[str, Any])`, `validate_charge(profile: Profile, payload: dict[str, Any]) -> ValidCharge | ChargeRefusal`, and `text_is_storable(value: str) -> bool` in `protocol/validation.py`; produce the lossless evidence codec above in `protocol/evidence.py`.
 
-- [ ] Write `test_identity_literal_vector_and_boundaries`; its assertions include:
+- [x] Write `test_identity_literal_vector_and_boundaries`; its assertions include:
 
 ```python
 assert str(operation_id(ctx)) == "112acdfc-c3cc-539a-9db0-5cc42dfa5e27"
@@ -107,10 +107,10 @@ for field in ("tenant", "run_id", "task_id"):
     assert operation_id(ctx.model_copy(update={field: "different"})) != operation_id(ctx)
 ```
 
-- [ ] Write `test_defaults_are_serializable_and_finite` with the exact settings above, rejected NaN/infinity/invalid renewal intervals, unsupported versions and unchanged zero episode-deadline behavior. Write `test_source_validation_matches_simulator` parameterized over missing/numeric/empty/256-character/NUL/surrogate keys, boolean/nonfinite/sub-cent amounts, extra fields, invalid currencies and equivalent decimal representations; compare status and body with the old service validator before moving it.
-- [ ] Write `test_evidence_round_trip_keeps_unstorable_and_envelope_shaped_input`: round-trip NUL, lone surrogate, literal backslash-u text, nested arguments and a model dictionary shaped like the trusted envelope; assert restored values equal originals, with no actual NUL/surrogate in packed database values.
-- [ ] Run `uv run pytest tests/execution/test_identity.py tests/execution/test_config.py tests/execution/test_validation.py tests/execution/test_evidence.py -q`; expect missing new interfaces, then implement those interfaces and move the validator without changing error order, wording or amount rules. Keep `service._validate_charge` as a small adapter to `SimResponse` so existing service callers remain stable. Do not change the slash-key contract.
-- [ ] Run the new tests plus `uv run pytest tests/unit tests/simulator/test_service.py tests/oracle/test_parity.py -q`; expect no failures. Check lint/format. Prepare the task diff for review before commit.
+- [x] Write `test_defaults_are_serializable_and_finite` with the exact settings above, rejected NaN/infinity/invalid renewal intervals, unsupported versions and unchanged zero episode-deadline behavior. Write `test_source_validation_matches_simulator` parameterized over missing/numeric/empty/256-character/NUL/surrogate keys, boolean/nonfinite/sub-cent amounts, extra fields, invalid currencies and equivalent decimal representations; compare status and body with the old service validator before moving it.
+- [x] Write `test_evidence_round_trip_keeps_unstorable_and_envelope_shaped_input`: round-trip NUL, lone surrogate, literal backslash-u text, nested arguments and a model dictionary shaped like the trusted envelope; assert restored values equal originals, with no actual NUL/surrogate in packed database values.
+- [x] Run `uv run pytest tests/execution/test_identity.py tests/execution/test_config.py tests/execution/test_validation.py tests/execution/test_evidence.py -q`; expect missing new interfaces, then implement those interfaces and move the validator without changing error order, wording or amount rules. Keep `service._validate_charge` as a small adapter to `SimResponse` so existing service callers remain stable. Do not change the slash-key contract.
+- [x] Run the new tests plus `uv run pytest tests/unit tests/simulator/test_service.py tests/oracle/test_parity.py -q`; expect no failures. Check lint/format. Prepare the task diff for review before commit.
 
 ### Task 2: Mode B and truthful execution records
 
@@ -118,7 +118,7 @@ for field in ("tenant", "run_id", "task_id"):
 
 **Interfaces:** Consume Task 1 and existing `DirectExecutor`/`render_observation`. Produce `RetryExecutor(client: SimulatorClient, config: ExecutionConfig, budget: DeadlineBudget, *, clock: Clock, guard: BoundaryGuard)` with `execute(call: ToolCall) -> ToolOutcome`. Extend the client constructor with optional `guard: BoundaryGuard | None = None`, `remaining_s: Callable[[], float] | None = None`; retain `charge(args)` and `status(key)` signatures. Produce `ExecutionEvidence` and exact observation constants above.
 
-- [ ] Write `test_retry_uses_one_key_and_two_waits`: give the fake transport three ambiguous responses and a fake clock; assert three charge sends, sleeps `[1.0, 2.0]`, unchanged payment arguments, and only the trusted effective key. Repeat with transport exceptions and assert `TRANSPORT_UNCERTAIN`, `http_status is None`, `request_count == 3` and attempted effective arguments retained.
+- [x] Write `test_retry_uses_one_key_and_two_waits`: give the fake transport three ambiguous responses and a fake clock; assert three charge sends, sleeps `[1.0, 2.0]`, unchanged payment arguments, and only the trusted effective key. Repeat with transport exceptions and assert `TRANSPORT_UNCERTAIN`, `http_status is None`, `request_count == 3` and attempted effective arguments retained.
 
 ```python
 assert len(sent) == 3
@@ -128,11 +128,11 @@ assert all(request["amount"] == requested["amount"] for request in sent)
 assert outcome.observation == TRANSPORT_UNCERTAIN
 assert outcome.http_status is None
 ```
-- [ ] Write `test_invalid_source_is_never_repaired`: invalid charge arguments take the original direct refusal path once, without key rewriting or retries; namespace-like arguments remain denied without HTTP. Write `test_status_maps_valid_requested_key_only`: valid model keys map to the trusted key; malformed status arguments retain the current invalid/refusal behavior. No journal rows exist in B.
-- [ ] Write `test_definitive_statuses_do_not_retry` for 400/401/404/409/422, `test_success_keeps_existing_renderer`, and `test_deadline_stops_wait_and_next_send`. Use the fake clock to exhaust the remaining budget during backoff and a client hook to observe each timeout bounded by remaining time.
-- [ ] Run `uv run pytest tests/execution/test_retry.py tests/execution/test_outcomes.py -q`; expect missing executor/evidence behavior. Implement source validation before rewriting; valid charge copies keep order/amount/currency, retry only 5xx/transport, at most three sends per invocation. Invalid calls use the existing direct refusal path, with no journal and no repaired key. Status is not automatically retried by B. A final transport failure uses the fixed uncertainty text; do not invent an HTTP status.
-- [ ] Apply the optional client guard and timeout cap immediately before each actual HTTP request. Do not change a supplied HTTP client's old timeout behavior when the new hooks are absent. A guard failure propagates to the worker; it is not a payment response. Build a scripted graph directly around B with `InMemorySaver` to prove the executor seam works; production `run_spec` remains A-only until Task 10 supplies safe preparation/resume.
-- [ ] Run `uv run pytest tests/execution tests/agent/test_executor.py tests/agent/test_client_binding.py tests/agent/test_observation_parity.py tests/agent/test_scripted_verdicts.py -q`; expect no failures. Check lint/format and stop for Run 2 review before commit.
+- [x] Write `test_invalid_source_is_never_repaired`: invalid charge arguments take the original direct refusal path once, without key rewriting or retries; namespace-like arguments remain denied without HTTP. Write `test_status_maps_valid_requested_key_only`: valid model keys map to the trusted key; malformed status arguments retain the current invalid/refusal behavior. No journal rows exist in B.
+- [x] Write `test_definitive_statuses_do_not_retry` for 400/401/404/409/422, `test_success_keeps_existing_renderer`, and `test_deadline_stops_wait_and_next_send`. Use the fake clock to exhaust the remaining budget during backoff and a client hook to observe each timeout bounded by remaining time.
+- [x] Run `uv run pytest tests/execution/test_retry.py tests/execution/test_outcomes.py -q`; expect missing executor/evidence behavior. Implement source validation before rewriting; valid charge copies keep order/amount/currency, retry only 5xx/transport, at most three sends per invocation. Invalid calls use the existing direct refusal path, with no journal and no repaired key. Status is not automatically retried by B. A final transport failure uses the fixed uncertainty text; do not invent an HTTP status.
+- [x] Apply the optional client guard and timeout cap immediately before each actual HTTP request. Do not change a supplied HTTP client's old timeout behavior when the new hooks are absent. A guard failure propagates to the worker; it is not a payment response. Build a scripted graph directly around B with `InMemorySaver` to prove the executor seam works; production `run_spec` remains A-only until Task 10 supplies safe preparation/resume.
+- [x] Run `uv run pytest tests/execution tests/agent/test_executor.py tests/agent/test_client_binding.py tests/agent/test_observation_parity.py tests/agent/test_scripted_verdicts.py -q`; expect no failures. Check lint/format and stop for Run 2 review before commit.
 
 ### Task 3: Additive persistence and operation registration
 
@@ -140,8 +140,8 @@ assert outcome.http_status is None
 
 **Interfaces:** Consume `ValidCharge`, trusted identity and configuration. Produce `OperationState` with the seven spec states; `Operation` frozen snapshot containing trusted context, original requested arguments/hash, effective key, state, attempt count, ownership/version, due/deadline timestamps, immutable `config: ExecutionConfig`, `last_evidence: dict[str, Any] | None` and `terminal_outcome: ToolOutcome | None`; `OperationClaim(operation_id: str, owner: str, version: int)`; `IntentConflict` and `LeaseLost` exceptions. Produce `Journal(conn: Connection[Any])` with `register(ctx: TrustedContext, charge: ValidCharge, requested_args: dict[str, Any], deadline_at: datetime, *, config: ExecutionConfig) -> Operation` and `get(operation_id: str) -> Operation`. Connections are service-role autocommit connections; each mutation owns an explicit short transaction.
 
-- [ ] Write `test_migration_preserves_old_rows_and_grants`: insert legacy run/model/tool/result records using migrations through 0003, apply 0004 twice through the migration runner, and assert old values unchanged, `resume_version is None`, runtime DML grants present, and ledger reader still unable to connect to runtime. Do not backfill invented run specifications or model invocations.
-- [ ] Write `test_register_is_unique_under_race` with two connections; assert one operation ID/key, state `READY`, zero attempts and the first canonical argument hash. Write `test_conflict_does_not_mutate_existing_intent`, including terminal rows and equivalent decimal strings. A first valid wrong amount remains stored wrong.
+- [x] Write `test_migration_preserves_old_rows_and_grants`: insert legacy run/model/tool/result records using migrations through 0003, apply 0004 twice through the migration runner, and assert old values unchanged, `resume_version is None`, runtime DML grants present, and ledger reader still unable to connect to runtime. Do not backfill invented run specifications or model invocations.
+- [x] Write `test_register_is_unique_under_race` with two connections; assert one operation ID/key, state `READY`, zero attempts and the first canonical argument hash. Write `test_conflict_does_not_mutate_existing_intent`, including terminal rows and equivalent decimal strings. A first valid wrong amount remains stored wrong.
 
 ```python
 assert first.id == second.id == str(operation_id(ctx))
@@ -149,7 +149,7 @@ assert first.state == OperationState.READY
 assert first.attempt_count == 0
 assert journal.get(first.id).args_hash == args_hash("1234", Decimal("49.99"), "USD")
 ```
-- [ ] Run `uv run pytest tests/execution/test_journal.py tests/runtime/test_runtime_db.py -q`; expect missing schema/journal. Implement migration and registration with uniqueness plus compare/read, not last-writer-wins argument replacement. Use the Task 1 codec at journal storage boundaries. Save the operation settings on first registration and verify them against the parent saved run. Commit a conflict audit event before raising `IntentConflict`, so transaction rollback does not erase the denial evidence.
+- [x] Run `uv run pytest tests/execution/test_journal.py tests/runtime/test_runtime_db.py -q`; expect missing schema/journal. Implement migration and registration with uniqueness plus compare/read, not last-writer-wins argument replacement. Use the Task 1 codec at journal storage boundaries. Save the operation settings on first registration and verify them against the parent saved run. Commit a conflict audit event before raising `IntentConflict`, so transaction rollback does not erase the denial evidence.
 
 Migration shape, decided here so later tasks share column names:
 
@@ -166,7 +166,7 @@ Migration shape, decided here so later tasks share column names:
 
 Use TIMESTAMPTZ for timestamps, JSONB for structured evidence and cascading cleanup only through the existing test/experiment deletion lifecycle. Grant runtime DML and sequences explicitly. Add partial due-work indexes for nonterminal operations, undelivered outbox and runnable deliveries. Do not modify checkpoint library tables or payments grants.
 
-- [ ] Run `uv run pytest tests/execution/test_journal.py tests/runtime -q`; expect no failures. Check lint/format and prepare review before commit.
+- [x] Run `uv run pytest tests/execution/test_journal.py tests/runtime -q`; expect no failures. Check lint/format and prepare review before commit.
 
 ### Task 4: Immutable preparation without destructive setup retries
 
@@ -174,8 +174,8 @@ Use TIMESTAMPTZ for timestamps, JSONB for structured evidence and cascading clea
 
 **Interfaces:** Consume Task 3 fields and `RunnerConfig`. Define the following data models in `runner/types.py` and preparation functions in `runner/prepared.py`, using type-only/deferred imports of the existing orchestration helpers to avoid an episode/prepared import cycle. Produce frozen `ModelDescriptor(kind: Literal["scripted", "openrouter", "injected"], model_id: str, policy: str | None = None, parameters: dict[str, Any] = {})`, rejecting secrets and unknown parameters. `WorkerInput` contains only trusted context, profile, task, prompt variant, status availability, model descriptor and saved limits; no hidden fault plan or expected verdict. `PreparedRun` contains saved identifiers, safe `WorkerInput`, initial messages and timestamps; `load_prepared` selects these explicit fields and never loads hidden setup/scoring input. Produce `prepare_run(spec: EpisodeSpec, model: ModelDescriptor, config: RunnerConfig, *, manifest_sha256: str, experiment_name: str = "adhoc", experiment_id: str | None = None, clock: Clock) -> PreparedRun`, and `load_prepared(conn: Connection[Any], run_id: str) -> PreparedRun`; absent metadata raises `LegacyResumeUnsupported`.
 
-- [ ] Write `test_prepare_is_immutable_and_idempotent`: repeat preparation for the same experiment/episode, assert same run/namespace/thread/start/deadline, unchanged saved inputs and one logical namespace creation. Changed model/config/manifest is refused before any reset. Secret values never enter either saved input JSON or repr.
-- [ ] Write `test_lost_setup_ack_preserves_existing_payment`: create namespace, commit a payment, simulate lost setup acknowledgement before `setup_state='ready'`, repeat preparation, and assert the effect and call-log entries still exist. Two concurrent preparations must share the same row. A pending setup cannot be delivered to a worker.
+- [x] Write `test_prepare_is_immutable_and_idempotent`: repeat preparation for the same experiment/episode, assert same run/namespace/thread/start/deadline, unchanged saved inputs and one logical namespace creation. Changed model/config/manifest is refused before any reset. Secret values never enter either saved input JSON or repr.
+- [x] Write `test_lost_setup_ack_preserves_existing_payment`: create namespace, commit a payment, simulate lost setup acknowledgement before `setup_state='ready'`, repeat preparation, and assert the effect and call-log entries still exist. Two concurrent preparations must share the same row. A pending setup cannot be delivered to a worker.
 
 ```python
 assert resumed.run_id == original.run_id
@@ -183,21 +183,21 @@ assert resumed.deadline_at == original.deadline_at
 assert ledger_after == ledger_before
 assert call_log_after == call_log_before
 ```
-- [ ] Run `uv run pytest tests/runner/test_prepared.py -q`; expect missing preparation. Add `service.configure_namespace_once(conn, namespace: str, profile: Profile, plan: FaultPlan) -> None`, using insert-if-absent and verifying existing profile/plan without deletion. A mismatch raises `NamespaceConfigConflict`.
-- [ ] Expose create-only behavior on the existing internal PUT when `If-None-Match: *` is supplied: 200 for new or identical existing configuration, 409 for conflicting configuration. Existing PUT without that header retains its documented reset behavior for old callers. Update protocol and HTTP tests; no new model tool or privilege is introduced.
-- [ ] Save the immutable run row in `pending` before setup; finish create-only setup and mark it `ready`. Retrying an interrupted pending preparation uses the same IDs and create-only request. Stamp start/deadline once, using the existing deadline convention, and preserve them on retry. `worker_input_json` is an explicit safe projection; worker code must not deserialize `episode_spec_json` or inspect the hidden fault plan. Full `EpisodeSpec` remains available only to trusted orchestration for setup/scoring.
-- [ ] Add `execution: ExecutionConfig = field(default_factory=ExecutionConfig)` to frozen `RunnerConfig`; extend its finite timeout/deadline validation while retaining zero episode deadline. Extend `experiment_config(model_id, config, manifest_sha256, *, model_descriptor: ModelDescriptor | None = None)` with version/settings and the descriptor; absent descriptor explicitly means injected model. Add `describe_model(model: ModelClient) -> ModelDescriptor` in `runner/prepared.py` and pass its result consistently from `run_spec`/`run_manifest` so their experiment hashes agree. Test stable hashes and legacy/config mismatch refusal. Injected model descriptors permit the existing in-process dependency-injection API but require a supplied model with matching ID on resume; they cannot be reconstructed by the process CLI. OpenRouter descriptors allow only the current constructor's nonsecret parameters: `base_url="https://openrouter.ai/api/v1"`, `min_interval_s=3.0`, `max_retries=5`, `timeout_s=60.0`. Save these effective values with the experiment/run; do not invent a temperature setting the client does not currently send. Provider keys remain external. Scripted policy must belong to `SCRIPTED_POLICIES`; never deserialize arbitrary callables or pickle.
-- [ ] Export `DEFAULT_BASE_URL` from the existing allowed `agent/openrouter.py` and consume it when building descriptors; do not copy the provider-host literal into another source/test file or widen the host-scan allowlist. Include this small constant change in Task 4's diff. Expose `ScriptedModel.policy: str` and `OpenRouterClient.parameters: dict[str, Any]` as fresh nonsecret copies for `describe_model`; store the requested timeout explicitly. Built-in default clients are reconstructible; arbitrary/injected model implementations or custom HTTP transports use `kind="injected"` and require in-process injection. Add these small changes to `agent/scripted.py` and `agent/openrouter.py` in Task 4. Never read private keys to construct descriptors.
-- [ ] Run `uv run pytest tests/runner/test_prepared.py tests/simulator/test_http.py tests/simulator/test_service.py tests/oracle/test_parity.py -q`; expect no failures. Check lint/format; prepare review before commit.
+- [x] Run `uv run pytest tests/runner/test_prepared.py -q`; expect missing preparation. Add `service.configure_namespace_once(conn, namespace: str, profile: Profile, plan: FaultPlan) -> None`, using insert-if-absent and verifying existing profile/plan without deletion. A mismatch raises `NamespaceConfigConflict`.
+- [x] Expose create-only behavior on the existing internal PUT when `If-None-Match: *` is supplied: 200 for new or identical existing configuration, 409 for conflicting configuration. Existing PUT without that header retains its documented reset behavior for old callers. Update protocol and HTTP tests; no new model tool or privilege is introduced.
+- [x] Save the immutable run row in `pending` before setup; finish create-only setup and mark it `ready`. Retrying an interrupted pending preparation uses the same IDs and create-only request. Stamp start/deadline once, using the existing deadline convention, and preserve them on retry. `worker_input_json` is an explicit safe projection; worker code must not deserialize `episode_spec_json` or inspect the hidden fault plan. Full `EpisodeSpec` remains available only to trusted orchestration for setup/scoring.
+- [x] Add `execution: ExecutionConfig = field(default_factory=ExecutionConfig)` to frozen `RunnerConfig`; extend its finite timeout/deadline validation while retaining zero episode deadline. Extend `experiment_config(model_id, config, manifest_sha256, *, model_descriptor: ModelDescriptor | None = None)` with version/settings and the descriptor; absent descriptor explicitly means injected model. Add `describe_model(model: ModelClient) -> ModelDescriptor` in `runner/prepared.py` and pass its result consistently from `run_spec`/`run_manifest` so their experiment hashes agree. Test stable hashes and legacy/config mismatch refusal. Injected model descriptors permit the existing in-process dependency-injection API but require a supplied model with matching ID on resume; they cannot be reconstructed by the process CLI. OpenRouter descriptors allow only the current constructor's nonsecret parameters: `base_url="https://openrouter.ai/api/v1"`, `min_interval_s=3.0`, `max_retries=5`, `timeout_s=60.0`. Save these effective values with the experiment/run; do not invent a temperature setting the client does not currently send. Provider keys remain external. Scripted policy must belong to `SCRIPTED_POLICIES`; never deserialize arbitrary callables or pickle.
+- [x] Export `DEFAULT_BASE_URL` from the existing allowed `agent/openrouter.py` and consume it when building descriptors; do not copy the provider-host literal into another source/test file or widen the host-scan allowlist. Include this small constant change in Task 4's diff. Expose `ScriptedModel.policy: str` and `OpenRouterClient.parameters: dict[str, Any]` as fresh nonsecret copies for `describe_model`; store the requested timeout explicitly. Built-in default clients are reconstructible; arbitrary/injected model implementations or custom HTTP transports use `kind="injected"` and require in-process injection. Add these small changes to `agent/scripted.py` and `agent/openrouter.py` in Task 4. Never read private keys to construct descriptors.
+- [x] Run `uv run pytest tests/runner/test_prepared.py tests/simulator/test_http.py tests/simulator/test_service.py tests/oracle/test_parity.py -q`; expect no failures. Check lint/format; prepare review before commit.
 
 ### Task 5: Common run claims and atomic checkpoint fencing
 
-**Files:** Create `src/lab/runner/ownership.py`, `src/lab/runtime/fenced_checkpoints.py`, `src/lab/execution/leases.py`, `tests/runner/test_ownership.py`, `tests/runtime/test_fenced_checkpoints.py`; modify `src/lab/agent/client.py` only if Task 2's hook needs composition.
+**Files:** Create `src/lab/runner/ownership.py`, `src/lab/runtime/{fenced_checkpoints,serde}.py`, `src/lab/execution/leases.py`, `tests/runner/test_ownership.py`, `tests/runtime/test_fenced_checkpoints.py`; modify `src/lab/agent/client.py` only if Task 2's hook needs composition.
 
 **Interfaces:** Produce `RunClaim(run_id: str, thread_id: str, owner: str, version: int, deadline_at: datetime)`, `claim_run(conn, run_id: str, owner: str, lease_s: float = 30.0) -> RunClaim | None`, `renew_run(conn, claim: RunClaim, lease_s: float = 30.0) -> bool`, `assert_run_owner(conn, claim: RunClaim) -> None`, and `finish_run(conn, claim: RunClaim, *, claimed_outcome: str | None, finished_at: datetime, state: str) -> None`. Expired or superseded claims raise `LeaseLost`; a live duplicate gets no claim. `RunGuard(conn, claim: RunClaim, budget: DeadlineBudget).check() -> None` checks both ownership and deadline. `LeaseHeartbeat(renew: Callable[[], bool], *, interval_s: float = 10.0)` is a context manager with `tick_once() -> bool` and `check() -> None`; use a separate connection from checkpoint/model/tool I/O.
 
-- [ ] Write `test_only_one_live_delivery_and_monotonic_takeover`: two connections compete; assert one owner, version increments after controlled expiry, and old renew/finalize fail. Repeat for every mode. Write `test_heartbeat_survives_blocked_model_call` using an event-controlled model and manual `tick_once`, not a 30-second sleep.
-- [ ] Write `test_stale_checkpoint_and_pending_writes_are_rejected`: first worker saves a checkpoint, expires, replacement claims; old saver `put` and `put_writes` both raise `LeaseLost`, and checkpoint/blobs/writes are unchanged. Also exercise lease expiry during a checkpoint transaction and rollback of every write. Reads needed for resumed invocation use the new claim.
+- [x] Write `test_only_one_live_delivery_and_monotonic_takeover`: two connections compete; assert one owner, version increments after controlled expiry, and old renew/finalize fail. Repeat for every mode. Write `test_heartbeat_survives_blocked_model_call` using an event-controlled model and manual `tick_once`, not a 30-second sleep.
+- [x] Write `test_stale_checkpoint_and_pending_writes_are_rejected`: first worker saves a checkpoint, expires, replacement claims; old saver `put` and `put_writes` both raise `LeaseLost`, and checkpoint/blobs/writes are unchanged. Also exercise lease expiry during a checkpoint transaction and rollback of every write. Reads needed for resumed invocation use the new claim.
 
 ```python
 assert replacement.version > original.version
@@ -207,10 +207,10 @@ with pytest.raises(LeaseLost):
     old_saver.put_writes(config, [("messages", ["stale"])], "task-1")
 assert checkpoint_rows_after == checkpoint_rows_before
 ```
-- [ ] Run `uv run pytest tests/runner/test_ownership.py tests/runtime/test_fenced_checkpoints.py -q`; expect missing ownership/saver. Implement `claim_run` with conditional UPDATE/row locking and PostgreSQL time, allowing only ready new-version queued/crashed/expired-running runs. Do not claim completed, abandoned or `score_failed` runs. A takeover never changes original inputs or deadline; increment `delivery_count` on each successful execution claim.
-- [ ] Implement `FencedPostgresSaver(conn: Connection[Any], claim: RunClaim)` as a small subclass of pinned `PostgresSaver`. Override `_cursor(*, pipeline: bool = False)` with a serialized, explicit transaction: acquire the saver lock, lock/check the run row, yield a binary dict-row cursor, recheck lease before commit, rollback on loss. Do not call the parent `_cursor` while holding its non-reentrant lock, and do not use a persistent pipeline. Keep inherited serialization/SQL and `get_next_version`. Minimal public-method wrappers must reject a thread ID other than `claim.thread_id` before delegating `put`, `put_writes` and reads; unfiltered cross-thread listing is disabled. Reject pool/pipeline inputs and disable `setup`/`delete_thread` on the worker adapter. The connection is dedicated to this saver, autocommit outside its short transactions. No HTTP runs while it holds the run row lock.
-- [ ] Add an installed-version contract test that `put` and `put_writes` still go through this boundary. Source inspected while writing this plan: checkpoint-postgres 3.1.2 calls `_cursor(pipeline=True)` for both and otherwise uses the same SQL serialization; this is a narrow private hook, so dependency changes must fail loudly. Run a real graph/checkpoint round trip, not only direct saver calls. Heartbeat locks must not deadlock checkpoint writes.
-- [ ] Run `uv run pytest tests/runner/test_ownership.py tests/runtime/test_fenced_checkpoints.py tests/runtime/test_checkpoints.py tests/agent/test_replay.py -q`; expect no failures. Check lint/format and prepare review before commit.
+- [x] Run `uv run pytest tests/runner/test_ownership.py tests/runtime/test_fenced_checkpoints.py -q`; expect missing ownership/saver. Implement `claim_run` with conditional UPDATE/row locking and PostgreSQL time, allowing only ready new-version queued/crashed/expired-running runs. Do not claim completed, abandoned or `score_failed` runs. A takeover never changes original inputs or deadline; increment `delivery_count` on each successful execution claim.
+- [x] Implement `FencedPostgresSaver(conn: Connection[Any], claim: RunClaim)` as a small subclass of pinned `PostgresSaver`. Override `_cursor(*, pipeline: bool = False)` with a serialized, explicit transaction: acquire the saver lock, lock/check the run row, yield a binary dict-row cursor, recheck lease before commit, rollback on loss. Do not call the parent `_cursor` while holding its non-reentrant lock, and do not use a persistent pipeline. Keep inherited serialization/SQL and `get_next_version`. Minimal public-method wrappers must reject a thread ID other than `claim.thread_id` before delegating `put`, `put_writes` and reads; unfiltered cross-thread listing is disabled. Reject pool/pipeline inputs and disable `setup`/`delete_thread` on the worker adapter. The connection is dedicated to this saver, autocommit outside its short transactions. No HTTP runs while it holds the run row lock.
+- [x] Add an installed-version contract test that `put` and `put_writes` still go through this boundary. Source inspected while writing this plan: checkpoint-postgres 3.1.2 calls `_cursor(pipeline=True)` for both and otherwise uses the same SQL serialization; this is a narrow private hook, so dependency changes must fail loudly. Run a real graph/checkpoint round trip, not only direct saver calls. Heartbeat locks must not deadlock checkpoint writes.
+- [x] Run `uv run pytest tests/runner/test_ownership.py tests/runtime/test_fenced_checkpoints.py tests/runtime/test_checkpoints.py tests/agent/test_replay.py -q`; expect no failures. Check lint/format and prepare review before commit.
 
 ### Task 6: Durable C normal path and replayed outcomes
 
@@ -218,8 +218,8 @@ assert checkpoint_rows_after == checkpoint_rows_before
 
 **Interfaces:** Extend `Journal` with `claim(operation_id: str, owner: str, lease_s: float) -> OperationClaim | None`, `renew(claim: OperationClaim, lease_s: float) -> bool`, `release(claim: OperationClaim) -> None`, `begin_attempt(claim: OperationClaim, max_attempts: int) -> Attempt`, and `apply(claim: OperationClaim, update: OperationUpdate) -> Operation`. `Attempt` exposes `id`, `number`, `fence_version`, `effective_args`; `OperationUpdate` is frozen with fields `state: OperationState`, `evidence: dict[str, Any]`, `next_check_at: datetime | None = None`, `status_check_count: int | None = None`, `attempt_id: str | None = None`, `http_status: int | None = None`, `response_body: dict[str, Any] | None = None`, `error_type: str | None = None`, `terminal_outcome: ToolOutcome | None = None`. `apply` owns attempt completion, event append and terminal outbox insertion atomically. Produce `Reconciler(journal: Journal, client: SimulatorClient, config: ExecutionConfig, *, clock: Clock, guard: BoundaryGuard)` with `step(operation_id: str, owner: str) -> Operation`. Produce `GatewayExecutor(client, journal, reconciler, config, budget, *, clock, guard)` with `execute(call) -> ToolOutcome`. `make_executor(mode: Mode, client, config, budget, *, clock, guard, journal: Journal | None = None) -> Executor` refuses C without a journal.
 
-- [ ] Write `test_intent_and_attempt_precede_send`: inspect runtime from inside a transport callback; assert saved original args/hash, state `IN_FLIGHT`, attempt number 1 and the trusted key before accepting HTTP. Valid success/replay with matching key/order/amount/currency yields `CONFIRMED_SUCCESS` and exactly one terminal outbox row.
-- [ ] Write `test_cached_success_makes_no_request`: repeat identical C call and assert unchanged attempt count, null effective request/status, original observation, `evidence.cached is True`. Changed canonical arguments produce `INTENT_CONFLICT`, no send, and an appended conflict event without changing state/intent, including a terminal operation. Equivalent amounts reuse the operation; a valid first wrong amount is never corrected.
+- [x] Write `test_intent_and_attempt_precede_send`: inspect runtime from inside a transport callback; assert saved original args/hash, state `IN_FLIGHT`, attempt number 1 and the trusted key before accepting HTTP. Valid success/replay with matching key/order/amount/currency yields `CONFIRMED_SUCCESS` and exactly one terminal outbox row.
+- [x] Write `test_cached_success_makes_no_request`: repeat identical C call and assert unchanged attempt count, null effective request/status, original observation, `evidence.cached is True`. Changed canonical arguments produce `INTENT_CONFLICT`, no send, and an appended conflict event without changing state/intent, including a terminal operation. Equivalent amounts reuse the operation; a valid first wrong amount is never corrected.
 
 ```python
 assert cached.observation == first.observation
@@ -229,10 +229,10 @@ assert request_count_after == request_count_before
 assert conflict.observation == INTENT_CONFLICT
 assert journal.get(op_id).args_hash == original_hash
 ```
-- [ ] Write `test_operation_claim_fences_attempts_and_terminal_commit`: two owners, expiry/takeover, stale response and terminal-write rollback. Assert attempt count increments atomically before sending and never exceeds configured three, including after restart. A crash between registration and first send leaves recoverable `READY` or recorded intended attempt evidence.
-- [ ] Run `uv run pytest tests/execution/test_gateway.py tests/execution/test_claims.py -q`; expect missing journal transitions/gateway. Implement short transactional operation claims and fenced mutations. `claim` increments version; expired `IN_FLIGHT` becomes `UNKNOWN` for status reconciliation. `begin_attempt` only accepts `READY`/provisional `CONFIRMED_NO_EFFECT`, remaining budget and unexpired deadline. Terminal writes clear ownership and insert `terminal-<operation_id>` in the same transaction.
-- [ ] Implement the foreground step initially for valid success/replay, definitive refusal and ambiguous classification; ambiguous work remains durably `UNKNOWN`. Matching structured 2xx evidence is required; malformed 2xx is uncertain. A foreground gateway drives bounded steps or waits on existing ownership until terminal/deadline, renewing its operation lease via Task 5's heartbeat. Source validation and status key mapping follow B; status-only lookup never registers an operation. Gate all foreground work through the common run guard.
-- [ ] Run `uv run pytest tests/execution tests/agent/test_observation_parity.py -q`; expect no failures. An ambiguous operation with no available recovery result must end truthfully `UNRESOLVED` at its deadline; Task 8 adds its recovery transitions. Check lint/format; production runner integration remains gated until Task 10.
+- [x] Write `test_operation_claim_fences_attempts_and_terminal_commit`: two owners, expiry/takeover, stale response and terminal-write rollback. Assert attempt count increments atomically before sending and never exceeds configured three, including after restart. A crash between registration and first send leaves recoverable `READY` or recorded intended attempt evidence.
+- [x] Run `uv run pytest tests/execution/test_gateway.py tests/execution/test_claims.py -q`; expect missing journal transitions/gateway. Implement short transactional operation claims and fenced mutations. `claim` increments version; expired `IN_FLIGHT` becomes `UNKNOWN` for status reconciliation. `begin_attempt` only accepts `READY`/provisional `CONFIRMED_NO_EFFECT`, remaining budget and unexpired deadline. Terminal writes clear ownership and insert `terminal-<operation_id>` in the same transaction.
+- [x] Implement the foreground step initially for valid success/replay, definitive refusal and ambiguous classification; ambiguous work remains durably `UNKNOWN`. Matching structured 2xx evidence is required; malformed 2xx is uncertain. A foreground gateway drives bounded steps or waits on existing ownership until terminal/deadline, renewing its operation lease via Task 5's heartbeat. Source validation and status key mapping follow B; status-only lookup never registers an operation. Gate all foreground work through the common run guard.
+- [x] Run `uv run pytest tests/execution tests/agent/test_observation_parity.py -q`; expect no failures. An ambiguous operation with no available recovery result must end truthfully `UNRESOLVED` at its deadline; Task 8 adds its recovery transitions. Check lint/format; production runner integration remains gated until Task 10.
 
 ### Task 7: Record every logical model invocation and its checkpoint identity
 
@@ -240,7 +240,7 @@ assert journal.get(op_id).args_hash == original_hash
 
 **Interfaces:** Produce `InvocationJournal(conn, claim: RunClaim)` with `start(*, turn: int, provider_model_id: str, messages: list[dict], tools: list[dict]) -> str`, `finish(invocation_id: str, result: ModelTurn, latency_ms: float) -> None`, `fail(invocation_id: str, error_type: str, latency_ms: float) -> None`. Extend `build_graph(..., invocations: InvocationJournal | None = None, guard: BoundaryGuard | None = None)`; add optional `model_invocation_id` to state. Extend `record_tool_event` with optional `model_invocation_id: str | None = None`; retain existing `record_model_call` as first-response compatibility snapshot. Add optional `guard` and `remaining_s` constructor hooks to `OpenRouterClient`, leaving legacy behavior unchanged when absent.
 
-- [ ] Write `test_replayed_turn_retains_both_invocations`: run the same logical model turn twice before checkpointing; assert two invocation IDs/response rows, distinct delivery versions where applicable, original legacy `model_calls` row unchanged, checkpoint state referencing the second actual response and tool-event reference matching it.
+- [x] Write `test_replayed_turn_retains_both_invocations`: run the same logical model turn twice before checkpointing; assert two invocation IDs/response rows, distinct delivery versions where applicable, original legacy `model_calls` row unchanged, checkpoint state referencing the second actual response and tool-event reference matching it.
 
 ```python
 assert len(rows) == 2
@@ -249,12 +249,12 @@ assert legacy_first_response_after == legacy_first_response_before
 assert state["model_invocation_id"] == rows[1]["id"]
 assert tool_event["model_invocation_id"] == rows[1]["id"]
 ```
-- [ ] Write `test_kill_before_model_response_leaves_started_unknown`: park the mock model after `start`; assert a durable invocation exists with null response/finish. Write `test_late_model_response_is_evidence_only`: after takeover, the original invocation may record its own response, but cannot change saved graph state, run result or start more work. The journal's finishing method can only complete its own matching invocation, never another delivery's row; it is observational evidence, not permission to execute.
-- [ ] Write `test_deadline_and_ownership_checked_before_provider_retry`: mock HTTP, pacing and retry waits; expire the budget/lease between attempts and assert no later send or extra budget claim. Provider retries still use the existing daily budget contract. One logical invocation must not be misreported as an exact HTTP-request count.
-- [ ] Run `uv run pytest tests/agent/test_invocations.py -q`; expect missing invocation lifecycle. Begin recording before `model.complete`, finish/fail after it, and place its ID in the same graph update as the actual assistant response. Pass that ID when recording tool events. Keep the provider payload and tool schemas unchanged; internal IDs do not enter model text. Check the common guard before model work and every executable tool call.
-- [ ] Apply provider hooks before each actual HTTP attempt, after pacing/backoff and before quota claim; cap each request timeout by remaining time. If a call already in progress finishes late, save its evidence and let the guard/checkpointer prevent further stale execution. Never rewrite the returned model claim or fill in a guessed response after a crash.
-- [ ] Use the Task 1 evidence codec and add optional `encoded_evidence: bool = False` to `PostgresRecorder`; new-version workers set it true. Write `test_unstorable_arguments_are_recorded_losslessly` against real Postgres: restore original request/response/tool-call JSON and untrusted TEXT exactly, including NUL/surrogate keys, without changing model-visible refusal text. Historical rows and unversioned caller shapes remain unchanged; version-aware audit readers decode new rows before comparisons. Do not weaken validation to avoid testing this path.
-- [ ] Run `uv run pytest tests/agent tests/runner/test_no_live_calls.py -q`; expect no failures. Check lint/format and stop for Run 3 review before commit; do not claim end-to-end redelivery yet.
+- [x] Write `test_kill_before_model_response_leaves_started_unknown`: park the mock model after `start`; assert a durable invocation exists with null response/finish. Write `test_late_model_response_is_evidence_only`: after takeover, the original invocation may record its own response, but cannot change saved graph state, run result or start more work. The journal's finishing method can only complete its own matching invocation, never another delivery's row; it is observational evidence, not permission to execute.
+- [x] Write `test_deadline_and_ownership_checked_before_provider_retry`: mock HTTP, pacing and retry waits; expire the budget/lease between attempts and assert no later send or extra budget claim. Provider retries still use the existing daily budget contract. One logical invocation must not be misreported as an exact HTTP-request count.
+- [x] Run `uv run pytest tests/agent/test_invocations.py -q`; expect missing invocation lifecycle. Begin recording before `model.complete`, finish/fail after it, and place its ID in the same graph update as the actual assistant response. Pass that ID when recording tool events. Keep the provider payload and tool schemas unchanged; internal IDs do not enter model text. Check the common guard before model work and every executable tool call.
+- [x] Apply provider hooks before each actual HTTP attempt, after pacing/backoff and before quota claim; cap each request timeout by remaining time. If a call already in progress finishes late, save its evidence and let the guard/checkpointer prevent further stale execution. Never rewrite the returned model claim or fill in a guessed response after a crash.
+- [x] Use the Task 1 evidence codec and add optional `encoded_evidence: bool = False` to `PostgresRecorder`; new-version workers set it true. Write `test_unstorable_arguments_are_recorded_losslessly` against real Postgres: restore original request/response/tool-call JSON and untrusted TEXT exactly, including NUL/surrogate keys, without changing model-visible refusal text. Historical rows and unversioned caller shapes remain unchanged; version-aware audit readers decode new rows before comparisons. Do not weaken validation to avoid testing this path.
+- [x] Run `uv run pytest tests/agent tests/runner/test_no_live_calls.py -q`; expect no failures. Check lint/format and stop for Run 3 review before commit; do not claim end-to-end redelivery yet.
 
 ### Task 8: Reconciliation and a separate sweeper
 
@@ -377,6 +377,78 @@ assert child_guard_refusals == []
 | Cross-process traces and nonfatal observability | 11–12 |
 | Actual SIGKILL, regression/mutation evidence, honest claims | 12 |
 
-**Review status:** awaiting user review of this implementation plan. Product code has not started. No task checkbox represents work already implemented.
+**Review status:** direct execution approved on 2026-10-20. Tasks 1–7 are implemented for the Run 3 review checkpoint; full-suite verification is recorded in the onboarding checkpoint note. Tasks 8–12 remain pending. The user approved committing and merging the Tasks 1–7 checkpoint into main on 2026-10-21.
 
-**Execution choice:** recommend native execution for this plan: the journal, run ownership and checkpoint adapter share several evolving interfaces, and keeping one implementer through each session reduces handoff overhead. Use a fresh independent reviewer for the final branch gate. Subagent-driven execution is also available if the user prefers independent review after every task; do not choose or launch agents before that preference is supplied. Both approaches preserve the review-before-commit checkpoints above.
+**Execution choice:** native execution, accepted on 2026-10-20: the journal, run ownership and checkpoint adapter share several evolving interfaces, and keeping one implementer through each session reduces handoff overhead. A fresh independent whole-branch reviewer remains scheduled for the Plan 4 final gate; no per-task implementer/reviewer agents are used. Review-before-commit checkpoints remain in place.
+
+
+## Run 2 implementation notes
+
+`SimulatorClient.with_bounds` supplies a non-owning view that combines the original
+client's guards/time limits with the retry budget. This prevents accidental use of
+an unbounded supplied client and preserves shorter per-phase timeouts. Mode B's
+simulator integration uses real loopback HTTP because Starlette's in-memory
+TestClient does not support request timeouts. The tests also compare received
+backend charge counts with execution evidence and score through `ledger_reader`.
+Production `run_spec` remains mode A only until Task 10; this checkpoint does not
+claim durable redelivery, a journal, or complete Plan 4 integration.
+
+Verification: full offline suite **1,123 passed in 79.45s**, no warnings;
+ruff lint/format and diff whitespace checks passed. The original baseline was
+1,016 tests; Run 2 adds 107. No model quota was used. Changes were left uncommitted at the Run 2 review checkpoint.
+
+## Run 3 implementation notes
+
+Tasks 3–7 add migration 0004, the immutable operation journal, create-only saved
+preparation, common run leases, atomic checkpoint fencing, C's normal graph path
+and model invocation evidence. The production runner remains A-only until Task 10.
+Task 8 still owns status reconciliation and the separate sweeper; ambiguous C
+work currently waits conservatively and becomes UNRESOLVED at its deadline.
+Terminal operation and outbox insertion are atomic; dispatch is Task 9.
+
+New `model_invocations.response_json` stores the full normalized `ModelTurn`,
+including its nested raw response, text and malformed flag. Separate tool-call
+fields remain available. The legacy `model_calls` snapshot retains its original
+first-response behavior and raw-response shape. New-version JSON/TEXT evidence
+uses the explicit ASCII codec; the saved run version determines decoding.
+`initial_messages_json` uses the same envelope; trusted worker/config/spec JSON
+remains structured. Pending preparation is never claimable.
+
+Provider hooks preserve one quota claim per logical complete, with no re-claim
+on HTTP retry. In bounded workers, initial pacing precedes that claim so an
+expired wait spends no new quota. A separate runtime connection renews operation
+leases; its password comes from psycopg's connection info because `info.dsn`
+intentionally excludes passwords. No credentials are saved in descriptors.
+Descriptors are revalidated before preparation writes, including nested mutable
+parameters. Charge JSON uses ASCII escapes so an unpaired surrogate reaches the
+simulator's existing refusal and can be recorded; decoded arguments, validation
+and model-visible responses are unchanged.
+
+Verification details and the review checkpoint are recorded in ONBOARDING.md and
+the local SDD ledger. The user approved committing and merging this checkpoint into main.
+
+A live operation owner is never stolen at foreground expiry. The foreground
+returns a deadline-sourced unresolved observation with the actual current
+operation state; the owner may still finish its already-sent request. This avoids
+a zero-wait loop while preserving fencing and late-effect uncertainty.
+
+Checkpoint encoding ruling: the pinned JsonPlusSerializer uses
+`OPT_REPLACE_SURROGATES`, which silently changes an unpaired surrogate to `?`.
+The new fenced saver composes `LosslessJsonPlusSerializer` for JSON-native graph
+values containing surrogates, using a saver-controlled `arl-json-ascii-v1` blob
+type and the existing ASCII codec. All other values retain the inherited
+serializer byte-for-byte; SQL, atomic cursor boundary and next-version behavior
+remain inherited. Non-JSON custom containers with surrogates fail clearly rather
+than silently changing data. The real HTTP/refusal test reloads its checkpoint
+and compares the original invalid key exactly. Legacy savers remain unchanged.
+
+Run 3 final verification (2026-10-21): **1,172 passed in 85.32s**, no warnings.
+Run 3 adds 49 tests to Run 2's 1,123. Ruff check and formatting (124 files),
+whitespace checks and measured-artifact preservation checks passed. Tasks 3–7
+are complete; Tasks 8–12 remain pending. The review checkpoint was left
+uncommitted at fa0e132 until the user approved integration into main.
+
+Publication authorization (2026-10-21): the user requested committing the reviewed
+Run 2–3 changes and pushing them into main. This publishes the Tasks 1–7
+checkpoint; it does not mark Plan 4 complete or change the review checkpoints
+for future implementation runs. The feature branch is retained for Tasks 8–12.

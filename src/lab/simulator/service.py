@@ -11,10 +11,8 @@ import contextlib
 import json
 import logging
 import math
-import re
 import time
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -23,15 +21,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from lab.protocol.faults import ChargeFault, FaultPlan
-from lab.protocol.task import (
-    NUMERIC_MAX_INTEGER_DIGITS,
-    NUMERIC_MAX_SCALE,
-    Profile,
-    args_hash,
-    is_minor_unit_amount,
-    is_storable_amount,
-    parse_amount,
-)
+from lab.protocol.task import Profile, args_hash
+from lab.protocol.validation import ChargeRefusal, validate_charge
+from lab.protocol.validation import ValidCharge as _ValidCharge
+from lab.protocol.validation import text_is_storable as _storable
 
 logger = logging.getLogger(__name__)
 
@@ -56,36 +49,6 @@ IN_FLIGHT = "in_flight"
 # Call-log outcome of a call that raised after its slot was claimed.
 SERVER_ERROR = "server_error"
 
-# \Z, not $: in Python `$` also matches just before a trailing newline, so "USD\n" would pass.
-_CURRENCY = re.compile(r"\A[A-Z]{3}\Z")
-_COMPAT_FIELDS = frozenset({"amount", "idempotency_key"})
-_CONTROLLED_FIELDS = frozenset({"amount", "idempotency_key", "order_id", "currency"})
-
-UNSTORABLE_MESSAGE = "must not contain a NUL character or an unpaired surrogate"
-AMOUNT_RANGE_MESSAGE = (
-    f"amount must have at most {NUMERIC_MAX_INTEGER_DIGITS} digits before the decimal point"
-    f" and {NUMERIC_MAX_SCALE} after it"
-)
-
-
-def _storable(value: str) -> bool:
-    """Whether Postgres text and jsonb can hold this string.
-
-    JSON allows any code point in a string, but Postgres rejects NUL, and an unpaired
-    surrogate (which json.loads accepts from "\\ud800") cannot be encoded as UTF-8. A
-    value like that fails inside the first statement that carries it, which for a charge
-    is the claim, so the attempt would leave no call_log row. Every other control character
-    (tab, newline, DEL, the Unicode line separators) is stored without trouble and stays
-    valid.
-    """
-    if "\x00" in value:
-        return False
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
 
 def _clean_str(value: str) -> str:
     """The same string made safe to store as evidence: NUL and surrogates become visible text."""
@@ -96,14 +59,6 @@ def _clean_str(value: str) -> str:
 class SimResponse:
     http_status: int
     body: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class _ValidCharge:
-    key: str
-    order_id: str | None
-    amount: Decimal
-    currency: str | None
 
 
 class UnknownNamespace(Exception):
@@ -144,6 +99,28 @@ def configure_namespace(
             "INSERT INTO sim_namespaces (namespace, profile, fault_plan) VALUES (%s, %s, %s)",
             (namespace, profile.value, Jsonb(plan.model_dump(mode="json"))),
         )
+
+
+class NamespaceConfigConflict(ValueError):
+    """Create-only setup cannot replace an existing namespace configuration."""
+
+
+def configure_namespace_once(
+    conn: psycopg.Connection, namespace: str, profile: Profile, plan: FaultPlan
+) -> None:
+    with conn.transaction():
+        conn.execute(
+            "INSERT INTO sim_namespaces(namespace,profile,fault_plan) "
+            "VALUES(%s,%s,%s) ON CONFLICT(namespace) DO NOTHING",
+            (namespace, profile.value, Jsonb(plan.model_dump(mode="json"))),
+        )
+        row = _one(
+            conn,
+            "SELECT profile,fault_plan FROM sim_namespaces WHERE namespace=%s FOR SHARE",
+            (namespace,),
+        )
+        if row["profile"] != profile.value or row["fault_plan"] != plan.model_dump(mode="json"):
+            raise NamespaceConfigConflict(namespace)
 
 
 def delete_namespace(conn: psycopg.Connection, namespace: str) -> None:
@@ -272,41 +249,10 @@ def _abort_call(conn: psycopg.Connection, log_id: int, started: float) -> None:
 
 
 def _validate_charge(profile: Profile, payload: dict[str, Any]) -> _ValidCharge | SimResponse:
-    allowed = _COMPAT_FIELDS if profile is Profile.COMPAT else _CONTROLLED_FIELDS
-    extra = sorted(set(payload) - allowed)
-    if extra:
-        return _error(400, "invalid_request", f"unexpected fields: {', '.join(extra)}")
-    key = payload.get("idempotency_key")
-    if not isinstance(key, str) or not 1 <= len(key) <= 255:
-        return _error(
-            400, "invalid_request", "idempotency_key must be a string of 1 to 255 characters"
-        )
-    if not _storable(key):
-        return _error(400, "invalid_request", f"idempotency_key {UNSTORABLE_MESSAGE}")
-    try:
-        amount = parse_amount(payload.get("amount"))
-    except ValueError as exc:
-        return _error(400, "invalid_request", str(exc))
-    if profile is Profile.COMPAT:
-        # Compat skips the controlled business rules on purpose, but an amount Postgres cannot
-        # store would fail inside the insert, after the attempt was claimed and counted. This
-        # runs in validation, before _claim_call, so such a call consumes no fault-schedule slot.
-        if not is_storable_amount(amount):
-            return _error(400, "invalid_request", AMOUNT_RANGE_MESSAGE)
-        return _ValidCharge(key, None, amount, None)
-    if not is_minor_unit_amount(amount):
-        return _error(
-            400, "invalid_request", "amount must be positive with at most two decimal places"
-        )
-    order_id = payload.get("order_id")
-    if not isinstance(order_id, str) or not 1 <= len(order_id) <= 64:
-        return _error(400, "invalid_request", "order_id must be a string of 1 to 64 characters")
-    if not _storable(order_id):
-        return _error(400, "invalid_request", f"order_id {UNSTORABLE_MESSAGE}")
-    currency = payload.get("currency")
-    if not isinstance(currency, str) or not _CURRENCY.match(currency):
-        return _error(400, "invalid_request", "currency must be a three-letter uppercase code")
-    return _ValidCharge(key, order_id, amount, currency)
+    result = validate_charge(profile, payload)
+    if isinstance(result, ChargeRefusal):
+        return SimResponse(result.http_status, result.body)
+    return result
 
 
 def _ambiguous_error(profile: Profile, committed: bool) -> SimResponse:

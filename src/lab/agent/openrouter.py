@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
 from lab.agent.model import ModelTurn, ToolCall
+from lab.execution.clock import BoundaryGuard, DeadlineExceeded
 from lab.runtime.budget import RequestBudget, assert_model_allowed
+
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 _RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _MAX_BACKOFF_S = 60.0
@@ -46,24 +51,39 @@ class OpenRouterClient:
         *,
         api_key: str | None = None,
         http_client: httpx.Client | None = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: str = DEFAULT_BASE_URL,
         min_interval_s: float = 3.0,
         max_retries: int = 5,
         timeout_s: float = 60.0,
         budget: RequestBudget | None = None,
+        guard: BoundaryGuard | None = None,
+        remaining_s: Callable[[], float] | None = None,
     ) -> None:
         assert_model_allowed(model_id)
         key = api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY")
         if not key:
             raise OpenRouterError("no OpenRouter API key: pass api_key or set OPENROUTER_API_KEY")
         self.model_id = model_id
+        self.reconstructible = http_client is None
+        self._parameters = dict(
+            base_url=base_url,
+            min_interval_s=min_interval_s,
+            max_retries=max_retries,
+            timeout_s=timeout_s,
+        )
         self._key = key
         self._http = http_client if http_client is not None else httpx.Client(timeout=timeout_s)
         self._url = f"{base_url.rstrip('/')}/chat/completions"
         self._min_interval_s = min_interval_s
         self._max_retries = max_retries
         self._budget = budget
+        self._guard, self._remaining_s = guard, remaining_s
+        self._bounded = guard is not None or remaining_s is not None
         self._last_request_monotonic: float | None = None
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return dict(self._parameters)
 
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         body: dict[str, Any] = {
@@ -74,15 +94,22 @@ class OpenRouterClient:
             body["tools"] = to_openai_tools(tools)
         headers = {"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"}
         failure = "no attempt made"
-        if self._budget is not None:
+        if self._budget is not None and not self._bounded:
             # One claim per logical request, before anything is sent. Retries do not re-claim,
             # and BudgetExceeded propagates so an over-budget request never leaves.
             self._budget.claim(1)
         for attempt in range(self._max_retries + 1):
+            self._check()
             self._pace()
+            self._check()
+            if attempt == 0 and self._bounded and self._budget is not None:
+                # Pacing can exhaust the deadline before any logical call begins.
+                self._budget.claim(1)
             wait = min(2.0**attempt, _MAX_BACKOFF_S)
             try:
-                response = self._http.post(self._url, headers=headers, json=body)
+                response = self._http.post(
+                    self._url, headers=headers, json=body, **self._request_options()
+                )
             except httpx.TransportError as exc:
                 failure = f"transport error {type(exc).__name__}"
             else:
@@ -96,7 +123,7 @@ class OpenRouterClient:
                 if advised is not None:
                     wait = advised
             if attempt < self._max_retries:
-                _sleep(wait)
+                self._wait(wait)
         raise OpenRouterError(f"gave up after {self._max_retries + 1} attempts: {failure}")
 
     def _pace(self) -> None:
@@ -104,9 +131,40 @@ class OpenRouterClient:
         if self._last_request_monotonic is not None:
             remaining = self._min_interval_s - (now - self._last_request_monotonic)
             if remaining > 0:
-                _sleep(remaining)
+                self._wait(remaining)
                 now = time.monotonic()
         self._last_request_monotonic = now
+
+    def _check(self) -> float | None:
+        if self._guard is not None:
+            self._guard.check()
+        if self._remaining_s is None:
+            return None
+        remaining = self._remaining_s()
+        if not math.isfinite(remaining):
+            raise ValueError("remaining request time must be finite")
+        if remaining <= 0:
+            raise DeadlineExceeded("the model request deadline has passed")
+        return remaining
+
+    def _wait(self, seconds: float) -> None:
+        remaining = self._check()
+        _sleep(seconds if remaining is None else min(seconds, remaining))
+        self._check()
+
+    def _request_options(self) -> dict[str, Any]:
+        remaining = self._check()
+        if remaining is None:
+            return {}
+        cap = min(remaining, self._parameters["timeout_s"])
+        return {
+            "timeout": httpx.Timeout(
+                **{
+                    phase: cap if value is None else min(cap, value)
+                    for phase, value in self._http.timeout.as_dict().items()
+                }
+            )
+        }
 
 
 def _sleep(seconds: float) -> None:

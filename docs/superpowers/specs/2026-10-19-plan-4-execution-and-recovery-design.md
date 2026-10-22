@@ -1,7 +1,7 @@
 # Plan 4 design: execution modes and durable payment recovery
 
 **Date:** 2026-10-19
-**Status:** written specification approved by the user’s “Continue working” instruction on 2026-10-20; implementation-plan review pending.
+**Status:** written specification approved by the user’s “Continue working” instruction on 2026-10-20; direct implementation approved on 2026-10-20; Run 2 Tasks 1–2 implemented, with later checkpoints pending.
 **Implementation plan:** [Plan 4 tasks and checkpoints](../plans/2026-10-20-plan-4-execution-and-recovery.md).
 **Base:** `main` at `ae76be5`, with Plans 1, 2 and 3 merged.
 **Scope:** the payment workflow in the controlled profile. No product code is
@@ -417,7 +417,8 @@ current all-in-one runner as already isolated at the process-credential level.
 These approved design refinements are not claims that the new behavior is
 already implemented or verified. D13 records the shared-restart rule. The user
 approved this written specification on 2026-10-20; the detailed implementation
-plan still awaits review before product code starts.
+plan was approved for direct execution on 2026-10-20. Run 2 covers its first two
+tasks; common run redelivery and durable C recovery remain future checkpoints.
 
 ## 13. Acceptance and review gates
 

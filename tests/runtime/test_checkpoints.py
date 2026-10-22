@@ -40,6 +40,12 @@ def test_setup_creates_exactly_the_tables_the_grant_list_names(runtime_db):
         "results",
         "request_budget",
         "schema_migrations",
+        "operations",
+        "attempts",
+        "recovery_events",
+        "outbox",
+        "model_invocations",
+        "run_deliveries",
     }
     assert created_by_langgraph == set(CHECKPOINT_TABLES)
 

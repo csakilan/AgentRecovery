@@ -26,9 +26,9 @@ how a failure is worded is itself an experimental variable there.
 from __future__ import annotations
 
 import json
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from lab.agent.client import DENIED_STATUS, NAMESPACE_DENIED, SimulatorClient
 from lab.agent.model import ToolCall
@@ -107,11 +107,34 @@ def _render_response(tool: str | None, http_status: int, body: dict[str, Any] | 
     return f"HTTP {http_status} {reason_phrase(http_status)}: {compact}"
 
 
+class ExecutionEvidence(BaseModel):
+    """Execution treatment evidence, distinct from the model's own claim or an oracle verdict."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    operation_id: str | None = None
+    operation_state: str | None = None
+    attempt_no: int | None = None
+    fence_version: int | None = None
+    source_kind: Literal[
+        "charge_response",
+        "status_response",
+        "transport_uncertainty",
+        "argument_conflict",
+        "deadline",
+    ]
+    source_http_status: int | None = None
+    last_http_tool: str | None = None
+    cached: bool = False
+    request_count: int = Field(default=0, ge=0)
+
+
 class ToolOutcome(BaseModel):
     """One executed (or refused) tool call, as the loop records it in `tool_events`.
 
     `effective_args` is None when nothing was sent, and so is `effective_key`. `http_status`
-    is None when no HTTP request was made, which includes a client denial: the client's
+    is None when no HTTP response status is available, including transport uncertainty and
+    a client denial: the client's
     `DENIED_STATUS` is not an HTTP status and never appears here.
     """
 
@@ -124,6 +147,7 @@ class ToolOutcome(BaseModel):
     rule: str
     observation: str
     http_status: int | None
+    evidence: ExecutionEvidence | None = None
 
 
 class Executor(Protocol):

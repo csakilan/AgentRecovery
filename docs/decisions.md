@@ -392,5 +392,7 @@ not yet satisfy this decision. Historical Plan 3 results remain unchanged.
 The [Plan 4 execution and recovery design](superpowers/specs/2026-10-19-plan-4-execution-and-recovery-design.md)
 records the details and acceptance checks; the user approved the written
 specification on 2026-10-20. The [implementation plan](superpowers/plans/2026-10-20-plan-4-execution-and-recovery.md)
-still awaits review before coding. D13 specifically records the shared restart
+was approved for direct execution on 2026-10-20. Runs 2–3 implement identity/retry, durable intent, saved preparation, common
+ownership/checkpoint fencing and invocation evidence. Shared production redelivery
+is still pending Task 10; background status recovery is Task 8. D13 records the restart
 rule; the linked documents carry the broader approved design and proposed tasks.

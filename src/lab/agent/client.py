@@ -23,13 +23,18 @@ the loop and the harness decide what an unreachable simulator means.
 from __future__ import annotations
 
 import copy
+import json
+import math
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Any
 from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, ConfigDict, StringConstraints
+
+from lab.execution.clock import BoundaryGuard, DeadlineExceeded
 
 # The status returned with a denial. It is not an HTTP status: no HTTP request was sent.
 # Callers must store a denial as http_status NULL, never as this number.
@@ -111,8 +116,9 @@ class SimulatorClient:
     `http_client` and `timeout` exist so a test can inject a client (a starlette TestClient
     or one with an `httpx.MockTransport`). Neither can carry a namespace: the header is set
     on every request from `ctx.namespace`, over anything a supplied client has by default.
-    A client passed in is the caller's to close and keeps its own timeout; `timeout` applies
-    to the client made here, which `close()` closes.
+    A client passed in is the caller's to close and keeps its own timeout unless explicit
+    execution bounds cap it. Bounds never increase a shorter per-phase timeout. `timeout`
+    applies to the client made here, which `close()` closes.
     """
 
     def __init__(
@@ -123,6 +129,8 @@ class SimulatorClient:
         *,
         http_client: httpx.Client | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
+        guard: BoundaryGuard | None = None,
+        remaining_s: Callable[[], float] | None = None,
     ) -> None:
         self._base_url = public_url.rstrip("/")
         self._headers = {
@@ -132,7 +140,42 @@ class SimulatorClient:
         self._ctx = ctx
         self._owns_client = http_client is None
         self._http = http_client if http_client is not None else httpx.Client(timeout=timeout)
+        self._timeout = timeout
+        self._guards = (guard,) if guard is not None else ()
+        self._limits = (remaining_s,) if remaining_s is not None else ()
         self._denials: list[Denial] = []
+
+    def with_bounds(
+        self, guard: BoundaryGuard, remaining_s: Callable[[], float]
+    ) -> SimulatorClient:
+        """A non-owning view that adds bounds without replacing the caller's existing ones."""
+        bounded = copy.copy(self)
+        bounded._owns_client = False
+        bounded._guards = (*self._guards, guard)
+        bounded._limits = (*self._limits, remaining_s)
+        return bounded
+
+    def _request_options(self) -> dict[str, Any]:
+        for guard in self._guards:
+            guard.check()
+        if not self._limits:
+            return {}
+        remaining = [limit() for limit in self._limits]
+        if not all(math.isfinite(value) for value in remaining):
+            raise ValueError("remaining request time must be finite")
+        cap = min(remaining)
+        if cap <= 0:
+            raise DeadlineExceeded("the execution deadline has passed")
+        if self._timeout is not None:
+            cap = min(cap, self._timeout)
+        return {
+            "timeout": httpx.Timeout(
+                **{
+                    phase: cap if value is None else min(cap, value)
+                    for phase, value in self._http.timeout.as_dict().items()
+                }
+            )
+        }
 
     @property
     def ctx(self) -> TrustedContext:
@@ -155,10 +198,25 @@ class SimulatorClient:
             offending = sorted(str(k) for k in args if _is_namespace_like(k))
             if offending:
                 return self._deny("charge", args, offending)
+        # JSON escape sequences preserve even an unpaired surrogate. httpx's
+        # default UTF-8 encoder otherwise crashes before the simulator can refuse
+        # that invalid argument. None keeps its historical empty-body behavior.
+        body = (
+            {"json": None}
+            if args is None
+            else {
+                "content": json.dumps(
+                    args, ensure_ascii=True, separators=(",", ":"), allow_nan=False
+                ).encode("ascii")
+            }
+        )
         response = self._http.post(
             f"{self._base_url}/v1/charges",
-            json=args,
-            headers=self._headers,
+            **body,
+            headers={**self._headers, "Content-Type": "application/json"}
+            if args is not None
+            else self._headers,
+            **self._request_options(),
         )
         return _decode(response)
 
@@ -167,6 +225,7 @@ class SimulatorClient:
         response = self._http.get(
             f"{self._base_url}/v1/payments/{_encode_path_segment(key)}",
             headers=self._headers,
+            **self._request_options(),
         )
         return _decode(response)
 
